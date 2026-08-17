@@ -7,13 +7,13 @@ Hits sec.gov on first run, then uses the local cache for a week.
 
 import logging
 
-from app.edgar import MissingUserAgentError, close_client
+from app.sec_http import MissingUserAgentError, close_client
 from app.tickers import UnknownTickerError, get_index, resolve_ticker
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-KNOWN = ["AAPL", "TSLA", "MSFT", "aapl"]  # lowercase to check normalization
-BOGUS = ["ZZZZ", "NOTAREALTICKER"]
+KNOWN = ["AAPL", "SPCX", "MSFT", "aapl"]  # lowercase to check normalization
+BOGUS = ["NOTREAL", "RETARD"]
 
 # Independently known-correct CIKs, so this is a real assertion rather than
 # "whatever EDGAR returned looks plausible".

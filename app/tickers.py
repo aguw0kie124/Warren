@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.config import settings
-from app.edgar import sec_get
+from app.sec_http import sec_get
 
 logger = logging.getLogger(__name__)
 

@@ -6,7 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 An AI-driven financial research platform: a user asks a natural-language question about a company ("What are Apple's key risk factors this year?") and gets an answer grounded in real SEC EDGAR filings via RAG, plus live market data via tools, with citations resolving back to the exact filing and section.
 
-**The project is mid-build and follows a strict incremental plan.** The full design and build order live at `~/.claude/plans/want-to-design-a-golden-barto.md` — read it before making architectural changes, since most decisions here were made deliberately and have recorded rationale.
+**The project is mid-build and follows a strict incremental plan.** The full design and build order live in `docs/PLAN.md` — read it before making architectural changes, since most decisions here were made deliberately and have recorded rationale.
+
+`docs/PLAN.md` is gitignored (local working copy). If it is missing after a fresh clone, the canonical original is at `~/.claude/plans/want-to-design-a-golden-barto.md`.
 
 ## Build status
 
