@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+.env
+
+# Downloaded filing HTML + cached EDGAR metadata — re-fetchable, don't commit.
+data/raw/
+data/cache/
