@@ -1,2 +1,2 @@
 # Warren
-WSB Companion
+AI powered financial research platform so I can stop gambling on robinhood...
