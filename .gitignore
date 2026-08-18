@@ -12,6 +12,7 @@ CLAUDE.md
 # Downloaded filing HTML + cached EDGAR metadata — re-fetchable, don't commit.
 data/raw/
 data/cache/
+data/retrieval_a7.json
 
 # Working copy of the build plan. Canonical original lives in
 # ~/.claude/plans/want-to-design-a-golden-barto.md
