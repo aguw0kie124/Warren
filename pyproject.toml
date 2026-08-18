@@ -30,8 +30,15 @@ dependencies = [
     # graph and the model (C2). langgraph brings its own prebuilt ToolNode and
     # tools_condition, which is why the loop is ~40 lines.
     "langchain-core>=0.3",
-    "langgraph>=0.2",
+    # 1.0 floor because of C3: `add_node(..., retry_policy=...)` has been
+    # renamed across releases (it was `retry=` in the 0.x line), and this is
+    # the line the retry policy was verified against.
+    "langgraph>=1.0",
     "langchain-anthropic>=0.3",
+    # Already present underneath langchain-anthropic; declared because C3
+    # imports its exception classes by name for the agent node's retry policy,
+    # and a transitive dependency is not a promise about what it exports.
+    "anthropic>=0.40",
 ]
 
 # Module D's dep (fastapi) gets added when that module is actually built — not

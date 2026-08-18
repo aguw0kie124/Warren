@@ -1,4 +1,4 @@
-"""C2 verification: the ReAct graph, judged on tool choice before answer quality.
+"""C2/C3 verification: the ReAct graph, judged on tool choice before answer quality.
 
     python scripts/check_agent.py                    # the benchmark set
     python scripts/check_agent.py --only 3 4         # just the news/web pair
@@ -27,6 +27,13 @@ removed once it had done that, because its token ceiling could not seat a
 multi-tool question and C3's `cache_control` prefix would have diverged the
 path it tested from the one this system ships. Every verdict below is
 therefore a real verdict — nothing is advisory, nothing is uncounted.
+
+C3 adds the token counts. Prompt caching changes no answer and raises no
+error when it stops working — it only changes the bill — so the per-turn
+`in / out · cache read / created` line under each question, and the summary
+check that reads it, are the only place the breakpoint is observable at all.
+The retry policy is covered offline in tests/test_agent.py, since making a
+real provider return 529 on demand is not something a gate can arrange.
 """
 
 import argparse
@@ -81,6 +88,16 @@ BENCHMARK = [
         set(),
     ),
 ]
+
+# C3 · The prefix length below which Anthropic ignores a cache breakpoint.
+#
+# **Measured on 2026-08-18, not read from the docs**, which give 2048 for the
+# Haiku family. `claude-haiku-4-5-20251001` did not cache a 4,007-token prefix
+# and did cache a 4,569-token one — a 4096 floor, double the published figure.
+# Nothing is raised either way: an ignored breakpoint returns an ordinary
+# response with zeroes in the cache columns, which is exactly what the numbers
+# below exist to make visible.
+CACHE_MINIMUM_TOKENS = 4096 if "haiku" in settings.anthropic_model else 1024
 
 # Question 6 only: the answer has to admit the gap rather than paper over it.
 GAP_MARKERS = ("not in the", "not been ingested", "not available", "no filings",
@@ -175,6 +192,8 @@ def check_question(index: int, question: str, required: set, forbidden: set,
         print(f"    [n] markers in answer: {', '.join(markers)}"
               f"  (citation list has {len(citations)}) ← C4c input")
 
+    print_usage(state)
+
     if not quiet:
         print(f"\n{indent(answer)}")
         if citations:
@@ -188,6 +207,83 @@ def check_question(index: int, question: str, required: set, forbidden: set,
 
 def indent(text: str, prefix: str = "    │ ") -> str:
     return "\n".join(prefix + line for line in text.splitlines())
+
+
+def print_usage(state: dict) -> None:
+    """Per-turn tokens. Read the cache columns, not the totals."""
+    rows = agent.token_usage(state.get("messages", []))
+    if not rows:
+        return
+    print("\n    tokens per turn (in / out · cache read / created):")
+    for i, row in enumerate(rows, start=1):
+        print(f"      {i}. {row['input']:>6} / {row['output']:<6}"
+              f" · {row['cache_read']:>6} / {row['cache_creation']:>6}")
+
+
+def check_prompt_cache(state: dict) -> None:
+    """C3's only observable.
+
+    A prefix that silently stops matching produces identical answers at a
+    higher price, so nothing above this line would notice. Turn 1 writes the
+    system + tool-schema prefix to cache; every later turn should read it back
+    and create nothing, because `agent_node` rebuilds a byte-identical prefix
+    each call. A later turn that re-creates the cache means something upstream
+    of the messages is varying between turns — that is the bug.
+    """
+    rule("prompt cache (C3)")
+    rows = agent.token_usage(state.get("messages", []))
+    if len(rows) < 2:
+        print("  (needs a run with at least two model turns — none of the "
+              "questions run made a tool call)")
+        return
+
+    first, rest = rows[0], rows[1:]
+
+    # A prefix under the model's floor is a property of the model, not a bug in
+    # this code, so it is reported rather than failed. Said plainly because the
+    # tempting reading of three zeroes is "caching is broken" — it is not; the
+    # breakpoint is correct and starts paying the moment the prefix clears the
+    # floor or the model changes to one with a lower one.
+    turn_one_prompt = first["input"] + first["cache_read"] + first["cache_creation"]
+    touched_cache = any(row["cache_read"] or row["cache_creation"] for row in rows)
+    if not touched_cache and turn_one_prompt < CACHE_MINIMUM_TOKENS:
+        print(f"  [-- ] inert on this model: the ~{turn_one_prompt}-token prompt is under "
+              f"{settings.anthropic_model}'s\n         {CACHE_MINIMUM_TOKENS}-token minimum "
+              "cacheable prefix, so Anthropic accepts the breakpoint\n         and ignores "
+              "it. Not counted as a failure — see CLAUDE.md.")
+        return
+
+    # Written *or* read, not written: the ephemeral cache outlives the process
+    # by five minutes, so a re-run inside that window legitimately opens on a
+    # hit. Requiring a write here would fail the gate for running it twice.
+    wrote, read = first["cache_creation"], first["cache_read"]
+    if wrote:
+        how = f"wrote {wrote} tokens"
+    elif read:
+        how = f"read {read} tokens — still warm from an earlier run"
+    else:
+        how = "wrote and read nothing"
+    if not verdict(bool(wrote or read), f"turn 1 reached the cache ({how})"):
+        print(f"        ↳ and the ~{turn_one_prompt}-token prompt clears "
+              f"{CACHE_MINIMUM_TOKENS}, so length is not the reason this time.\n"
+              "          Check that the system block still reaches the provider as a "
+              "content-block\n          list carrying cache_control — a bare string "
+              "caches nothing and raises nothing.")
+
+    turns = "turn 2" if len(rest) == 1 else f"turns 2-{len(rows)}"
+    verdict(
+        all(row["cache_read"] > 0 for row in rest),
+        f"{turns} read the prefix from cache "
+        f"({', '.join(str(row['cache_read']) for row in rest)} tokens)",
+    )
+
+    recreated = [i for i, row in enumerate(rest, start=2) if row["cache_creation"] > 0]
+    verdict(
+        not recreated,
+        "no later turn re-created the cache"
+        + (f" (turn(s) {recreated} did — something upstream of the messages "
+           "is varying between turns)" if recreated else ""),
+    )
 
 
 def check_citation_urls(state: dict) -> None:
@@ -237,12 +333,14 @@ def main() -> None:
     configure()
 
     last_state: dict = {}
+    cache_state: dict = {}
     try:
         if args.ask:
             rule(args.ask)
             state = run_streaming(args.ask)
             called = {name for name, _ in agent.tool_calls_made(state["messages"])}
             print(f"\n    tools called: {', '.join(sorted(called)) or 'none'}")
+            print_usage(state)
             print(f"\n{indent(agent.final_text(state['messages']))}")
             for citation in state.get("citations", []):
                 print(f"      [{citation.type}] {citation.label}\n          {citation.source_url}")
@@ -256,8 +354,13 @@ def main() -> None:
             # check below costs nothing extra.
             if not last_state and any(c.type == "filing" for c in state.get("citations", [])):
                 last_state = state
+            # And the first multi-turn run, which is the only kind that can
+            # show a cache read: turn 1 can only ever create.
+            if not cache_state and len(agent.token_usage(state["messages"])) > 1:
+                cache_state = state
 
         check_citation_urls(last_state)
+        check_prompt_cache(cache_state)
 
         rule("summary")
         if FAILURES:

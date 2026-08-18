@@ -8,9 +8,13 @@ their types intact and without repeats.
 
 The citation path is the part that fails invisibly. If artifacts stop being
 collected, nothing errors — the answers still read fine, they just quietly
-lose their sources.
+lose their sources. C3's two additions fail the same way: a cache breakpoint
+that stops being sent costs money and changes no output, and a retry policy is
+only observable when the provider is failing.
 """
 
+import anthropic
+import httpx
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -22,16 +26,27 @@ class ScriptedModel:
     """Stands in for the tool-bound ChatAnthropic.
 
     Returns pre-written AIMessages in order, and records what it was asked, so
-    a test can assert the tool results actually came back to the model.
+    a test can assert the tool results actually came back to the model. An
+    exception in the script is raised instead of returned, which is how the
+    retry tests make the provider fail.
     """
 
-    def __init__(self, *responses: AIMessage) -> None:
+    def __init__(self, *responses: AIMessage | Exception) -> None:
         self.responses = list(responses)
         self.calls: list[list] = []
 
     def invoke(self, messages, **kwargs):
         self.calls.append(list(messages))
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def api_error(error: type[anthropic.APIStatusError], status: int):
+    """One Anthropic HTTP failure, shaped the way the SDK raises it."""
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    return error("boom", response=httpx.Response(status, request=request), body=None)
 
 
 def tool_call(name: str, args: dict, id: str = "call-1") -> dict:
@@ -52,6 +67,21 @@ def scripted(monkeypatch):
 
 @pytest.fixture
 def graph():
+    return agent.build_graph()
+
+
+@pytest.fixture
+def fast_retry_graph(monkeypatch):
+    """The real graph, with the real retry policy's waits collapsed.
+
+    Only the timing is changed — `max_attempts` and, crucially, `retry_on` are
+    the shipped values, because which exceptions retry is the whole point.
+    """
+    monkeypatch.setattr(
+        agent,
+        "RETRY_POLICY",
+        agent.RETRY_POLICY._replace(initial_interval=0.01, jitter=False),
+    )
     return agent.build_graph()
 
 
@@ -146,6 +176,155 @@ def test_parallel_tool_calls_in_one_turn(scripted, graph, stub_search, monkeypat
         "get_quote",
     ]
     assert "unavailable" in agent.final_text(state["messages"])
+
+
+# --- C3 · prompt caching ----------------------------------------------------
+
+
+def test_system_prompt_carries_a_cache_breakpoint(scripted, graph):
+    model = scripted(AIMessage("done"))
+
+    graph.invoke({"messages": [HumanMessage("hi")], "citations": []})
+
+    system = model.calls[0][0]
+    assert system.type == "system"
+    # A content-block list, not a bare string — that is the only place
+    # cache_control can be attached.
+    assert system.content == [
+        {
+            "type": "text",
+            "text": agent.SYSTEM_PROMPT,
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+
+def test_the_cached_prefix_is_identical_across_turns(scripted, graph, stub_search):
+    """Byte-identical, or the second turn pays to create the cache again."""
+    model = scripted(
+        AIMessage("", tool_calls=[tool_call("search_filings", {"query": "q", "ticker": "AAPL"})]),
+        AIMessage("done"),
+    )
+
+    graph.invoke({"messages": [HumanMessage("q")], "citations": []})
+
+    first, second = model.calls
+    assert first[0].content == second[0].content
+
+
+def test_the_system_block_is_not_shared_between_turns(scripted, graph, stub_search):
+    """Each turn gets its own dicts, so a mutating formatter cannot poison the prefix."""
+    model = scripted(
+        AIMessage("", tool_calls=[tool_call("search_filings", {"query": "q", "ticker": "AAPL"})]),
+        AIMessage("done"),
+    )
+
+    graph.invoke({"messages": [HumanMessage("q")], "citations": []})
+
+    first, second = model.calls
+    assert first[0].content[0] is not second[0].content[0]
+
+
+def test_token_usage_reads_both_cache_creation_shapes():
+    """The provider reports creation generically or per-TTL; both must count.
+
+    LangChain zeroes the generic key when the per-TTL breakdown is present, so
+    reading only one of them under-reports depending on which shape came back.
+    """
+    generic = AIMessage(
+        "a",
+        usage_metadata={
+            "input_tokens": 2400, "output_tokens": 10, "total_tokens": 2410,
+            "input_token_details": {"cache_read": 0, "cache_creation": 2000},
+        },
+    )
+    per_ttl = AIMessage(
+        "b",
+        usage_metadata={
+            "input_tokens": 2400, "output_tokens": 10, "total_tokens": 2410,
+            "input_token_details": {
+                "cache_read": 0, "cache_creation": 0, "ephemeral_5m_input_tokens": 2000,
+            },
+        },
+    )
+
+    assert [row["cache_creation"] for row in agent.token_usage([generic, per_ttl])] == [
+        2000,
+        2000,
+    ]
+
+
+def test_token_usage_skips_messages_without_usage():
+    assert agent.token_usage([HumanMessage("q"), AIMessage("a")]) == []
+
+
+# --- C3 · node-level retry --------------------------------------------------
+
+
+def test_a_transient_provider_failure_is_retried(scripted, fast_retry_graph):
+    model = scripted(
+        api_error(anthropic.InternalServerError, 529),
+        api_error(anthropic.InternalServerError, 529),
+        AIMessage("Recovered on the third attempt."),
+    )
+
+    state = fast_retry_graph.invoke({"messages": [HumanMessage("q")], "citations": []})
+
+    assert len(model.calls) == 3
+    assert agent.final_text(state["messages"]) == "Recovered on the third attempt."
+
+
+def test_a_rate_limit_is_retried(scripted, fast_retry_graph):
+    model = scripted(api_error(anthropic.RateLimitError, 429), AIMessage("done"))
+
+    fast_retry_graph.invoke({"messages": [HumanMessage("q")], "citations": []})
+
+    assert len(model.calls) == 2
+
+
+def test_retry_survives_completed_tool_work(scripted, fast_retry_graph, stub_search):
+    """The point of retrying mid-loop: a 429 on a later turn must not discard
+    the tool calls already made, or the run pays for that work twice."""
+    scripted(
+        AIMessage("", tool_calls=[tool_call("search_filings", {"query": "q", "ticker": "AAPL"})]),
+        api_error(anthropic.RateLimitError, 429),
+        AIMessage("Answered after the rate limit cleared."),
+    )
+
+    state = fast_retry_graph.invoke({"messages": [HumanMessage("q")], "citations": []})
+
+    assert len(tool_calls_made(state["messages"])) == 1
+    assert len(state["citations"]) == 1
+
+
+def test_a_bad_api_key_fails_immediately(scripted, fast_retry_graph):
+    """A 401 is the same 401 on the third attempt — retrying only spends time.
+
+    LangGraph's default `retry_on` would retry this, which is why the policy
+    names its exceptions explicitly.
+    """
+    model = scripted(api_error(anthropic.AuthenticationError, 401))
+
+    with pytest.raises(anthropic.AuthenticationError):
+        fast_retry_graph.invoke({"messages": [HumanMessage("q")], "citations": []})
+
+    assert len(model.calls) == 1
+
+
+def test_a_bad_request_fails_immediately(scripted, fast_retry_graph):
+    model = scripted(api_error(anthropic.BadRequestError, 400))
+
+    with pytest.raises(anthropic.BadRequestError):
+        fast_retry_graph.invoke({"messages": [HumanMessage("q")], "citations": []})
+
+    assert len(model.calls) == 1
+
+
+def test_only_the_agent_node_is_retried(graph):
+    """Retrying `tools` would re-bill live Finnhub and Tavily calls to paper
+    over failures C1 deliberately returns as text rather than raising."""
+    assert agent.RETRY_POLICY in graph.nodes["agent"].retry_policy
+    assert graph.nodes["tools"].retry_policy is None
 
 
 # --- citations --------------------------------------------------------------

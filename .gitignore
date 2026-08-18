@@ -17,3 +17,4 @@ data/retrieval_a7.json
 # Working copy of the build plan. Canonical original lives in
 # ~/.claude/plans/want-to-design-a-golden-barto.md
 docs/PLAN.md
+docs/*.bak

@@ -16,16 +16,23 @@ Tool results carry `Citation` objects as ToolMessage artifacts (C1), so
 `tool_node` reads them off and merges them into state. They are never asked of
 the model: an LLM handed an accession number will reformat it, and a citation
 that doesn't resolve is worse than none because it looks audited.
+
+C3 adds two things to *how* the model is called, neither of which changes what
+the graph does: a prompt-cache breakpoint on the system + tools prefix, and a
+retry policy on the `agent` node alone. See `_system_message()` and
+`RETRY_POLICY`.
 """
 
 import logging
 from typing import Annotated, TypedDict
 
+import anthropic
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.types import RetryPolicy
 
 from app.config import settings
 from app.tools import TOOLS, Citation
@@ -60,6 +67,72 @@ Call tools in parallel when the question has independent parts, and call the sam
 There is **no price history** available: nothing can answer "how has the stock moved since the 10-K". Say that plainly if asked.
 
 Write for someone who reads financial documents. Be specific and quantitative where the sources are, brief where they are not, and never pad an answer to look thorough."""
+
+# C3 · One cache breakpoint, on the system block.
+#
+# Anthropic's cacheable prefix is ordered **tools → system → messages**, so a
+# single breakpoint here also covers the five tool schemas sitting ahead of it:
+# together a fixed ~3.0k-token prefix (2.4k of tool schema, 0.6k of prompt)
+# that is re-sent on every iteration of a loop a multi-hop question goes around
+# five or six times.
+#
+# This only works because `agent_node` prepends the prompt per call instead of
+# storing it in state — the prefix is byte-identical every turn, which is the
+# whole precondition for a prefix cache.
+#
+# **On the pinned Haiku model it is currently inert**, and knowingly so: that
+# model ignores a breakpoint under 4096 tokens (measured — the docs say 2048),
+# which 3.0k does not clear. Nothing is raised; the cache columns just read
+# zero. The breakpoint stays because it is correct, costs nothing, and starts
+# paying the moment the prefix grows or the model changes. `scripts/
+# check_agent.py` reports the inert case by name rather than failing on it.
+#
+# **No message-level breakpoint.** A second one on the last message would cache
+# the conversation itself, but C4's context guard rewrites that history —
+# invalidating it exactly when the conversation has grown long enough for the
+# caching to have mattered. This one is always valid.
+def _system_message() -> SystemMessage:
+    """The system prompt as a single cache-marked content block.
+
+    Built fresh per call rather than held as a module constant. The *text* is
+    identical every time, which is all the cache requires; nothing is shared
+    between turns, because the message formatter is free to mutate the dicts
+    it is handed and a mutated prefix would stop matching with nothing raised.
+    """
+    return SystemMessage(
+        [
+            {
+                "type": "text",
+                "text": SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+    )
+
+
+# C3 · Retry the model call, and only the model call.
+#
+# `retry_on` is listed explicitly because LangGraph's default retries almost
+# everything it is not told to skip — under that default a bad API key would
+# burn three attempts and ~7s of backoff to arrive at the same 401. These three
+# are the failures where a second attempt is genuinely a different roll:
+# 429s, Anthropic 5xx (including 529 overloaded), and transport errors
+# (`APITimeoutError` subclasses `APIConnectionError`).
+#
+# Not redundant with `ChatAnthropic`'s own `max_retries` — this layers above it
+# and survives a client that has exhausted its attempts. Mid-loop is where it
+# earns its place: a 429 on the fourth turn otherwise discards three turns of
+# completed tool work, and the money already spent on them.
+RETRY_POLICY = RetryPolicy(
+    max_attempts=3,
+    initial_interval=1.0,
+    backoff_factor=2.0,
+    retry_on=(
+        anthropic.RateLimitError,
+        anthropic.InternalServerError,
+        anthropic.APIConnectionError,
+    ),
+)
 
 
 def merge_citations(
@@ -146,9 +219,11 @@ def agent_node(state: AgentState) -> dict:
     keeps it out of the conversation the model sees itself as having written
     and keeps the cacheable prefix identical on every turn.
     """
-    response = get_llm().invoke([SystemMessage(SYSTEM_PROMPT), *state["messages"]])
+    response = get_llm().invoke([_system_message(), *state["messages"]])
     logger.debug(
-        "agent turn: %d tool call(s)", len(getattr(response, "tool_calls", []) or [])
+        "agent turn: %d tool call(s), %s",
+        len(getattr(response, "tool_calls", []) or []),
+        _usage_line(response) or "no usage reported",
     )
     return {"messages": [response]}
 
@@ -183,7 +258,11 @@ def tool_node(state: AgentState) -> dict:
 def build_graph():
     """Compile the loop. Two nodes and one conditional edge — that is all of it."""
     builder = StateGraph(AgentState)
-    builder.add_node("agent", agent_node)
+    # Retry `agent` only. The tools node deliberately converts provider
+    # failures into text the model can act on (C1), so retrying it would
+    # re-bill live Finnhub and Tavily calls to paper over something that is
+    # not an exception in the first place.
+    builder.add_node("agent", agent_node, retry_policy=RETRY_POLICY)
     builder.add_node("tools", tool_node)
 
     builder.add_edge(START, "agent")
@@ -240,6 +319,54 @@ def final_text(messages: list[AnyMessage]) -> str:
         for block in content
         if isinstance(block, dict) and block.get("type") == "text"
     ).strip()
+
+
+def token_usage(messages: list[AnyMessage]) -> list[dict[str, int]]:
+    """Per-model-turn token counts, in turn order — the only view of the cache.
+
+    Whether C3's breakpoint is working is invisible in the answers: a prefix
+    that silently stops matching costs money and changes nothing else. Turn 1
+    should show `cache_creation`, every later turn `cache_read` covering the
+    system + tools prefix with near-zero creation.
+
+    `cache_creation` sums the generic count and the per-TTL ones, because
+    LangChain zeroes the generic key when the provider reports the ephemeral
+    breakdown — reading only one of them under-reports depending on the reply.
+    """
+    rows: list[dict[str, int]] = []
+    for message in messages:
+        usage = getattr(message, "usage_metadata", None)
+        if not usage:
+            continue
+        details = usage.get("input_token_details") or {}
+        rows.append(
+            {
+                "input": usage.get("input_tokens", 0) or 0,
+                "output": usage.get("output_tokens", 0) or 0,
+                "cache_read": details.get("cache_read") or 0,
+                "cache_creation": sum(
+                    details.get(key) or 0
+                    for key in (
+                        "cache_creation",
+                        "ephemeral_5m_input_tokens",
+                        "ephemeral_1h_input_tokens",
+                    )
+                ),
+            }
+        )
+    return rows
+
+
+def _usage_line(message: AnyMessage) -> str:
+    """One turn's token counts, for the debug log."""
+    rows = token_usage([message])
+    if not rows:
+        return ""
+    row = rows[0]
+    return (
+        f"in={row['input']} out={row['output']} "
+        f"cache_read={row['cache_read']} cache_creation={row['cache_creation']}"
+    )
 
 
 def tool_calls_made(messages: list[AnyMessage]) -> list[tuple[str, dict]]:
