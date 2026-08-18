@@ -22,16 +22,19 @@ class Settings(BaseSettings):
     edgar_user_agent: str = ""
 
     # --- embeddings (A6) ---
-    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # Gated HF repo: accept the license at huggingface.co/google/embeddinggemma-300m
+    # and `huggingface-cli login` once before the first download.
+    embedding_model: str = "google/embeddinggemma-300m"
     # Must match the vector(N) column in sql/schema.sql.
-    embedding_dim: int = 384
+    embedding_dim: int = 768
 
     # --- chunking (A5) ---
-    # bge-small-en-v1.5 has a 512-token max sequence length; anything longer is
-    # silently truncated at embed time. 400 leaves headroom for the query prefix
-    # and sentence-boundary slop, so a stored chunk is always fully embedded.
-    chunk_tokens: int = 400
-    chunk_overlap_tokens: int = 50
+    # A retrieval-quality choice, not a model limit: EmbeddingGemma accepts 2048
+    # tokens, but a chunk spanning several distinct risk factors averages into a
+    # vector that matches none of them well. ~512 tokens is roughly one named
+    # risk factor — the unit questions are actually about.
+    chunk_tokens: int = 512
+    chunk_overlap_tokens: int = 64
 
     # --- paths ---
     raw_dir: Path = PROJECT_ROOT / "data" / "raw"

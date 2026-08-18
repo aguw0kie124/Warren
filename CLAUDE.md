@@ -16,12 +16,16 @@ Work proceeds module by module, and **each step stops for human verification bef
 
 | Module | Steps | Status |
 |---|---|---|
-| **A** — data pipeline (EDGAR → Postgres, retrieval) | A0–A8 | A0 done; A1 next |
+| **A** — data pipeline (EDGAR → Postgres, retrieval) | A0–A8 | A0–A4 done; **A5 next** |
 | **B** — live data (Finnhub, Tavily) | B1–B2 | not started |
 | **C** — LangGraph agent | C1–C2 | not started |
 | **D** — FastAPI service | D1 | not started |
 
-Module A step map: A0 schema · A1 `tickers.py` · A2/A3 `edgar.py` · A4 `parser.py` · A5 `chunker.py` · A6 `embeddings.py`+`store.py`+`scripts/ingest.py` · A7 dense retrieval · A8 hybrid retrieval.
+Module A step map: A0 schema · A1 `tickers.py` · A2/A3 `edgar.py` (+ `sec_http.py`) · A4 `parser.py` · A5 `chunker.py` · A6 `embeddings.py`+`store.py`+`scripts/ingest.py` · A7 dense retrieval · A8 hybrid retrieval.
+
+Each step has a `scripts/check_*.py` gate: `check_db`, `check_tickers`, `check_edgar`, `check_parser`.
+
+**Outstanding before A6:** the schema still declares `vector(384)` from the original bge-small choice. Both tables are empty, so `DROP TABLE IF EXISTS chunks, filings CASCADE;` then re-run `init_schema()` — free now, a migration plus full re-embed later.
 
 Dependencies for unstarted modules are deliberately **not** in `pyproject.toml` — add them when the module is built, not before.
 
@@ -83,11 +87,13 @@ Models mangle URLs and invent accession numbers, while the retriever already kno
 
 ## Constraints that will silently break things
 
-**Embedding dimension is coupled across three places.** `bge-small-en-v1.5` → 384 dims → `vector(384)` in `sql/schema.sql` → `settings.embedding_dim`. Changing the model means changing all three plus reindexing.
+**Embedding dimension is coupled across three places.** `google/embeddinggemma-300m` → 768 dims → `vector(768)` in `sql/schema.sql` → `settings.embedding_dim`. Changing the model means changing all three plus a full re-embed.
 
-**Chunks must stay under 512 tokens.** `bge-small-en-v1.5` has a 512-token max sequence length and **truncates silently** — no error. `chunk_tokens` defaults to 400 for headroom. Raising it past ~450 means stored chunks are only partially embedded, degrading retrieval in a way that is very hard to trace. (This is why chunk size is 400 rather than the 800–1200 an earlier draft of the plan specified.)
+**EmbeddingGemma is a gated HF repo.** Before the first embedding run, accept the license at `huggingface.co/google/embeddinggemma-300m` and `huggingface-cli login` (or set `HF_TOKEN`). One-time download gate only — once cached, embedding runs offline with no per-request key.
 
-**bge query/passage asymmetry.** bge models want the prefix `"Represent this sentence for searching relevant passages: "` on **queries only**, never on stored passages. Keep this inside `embed_query()` vs `embed_documents()` so callers cannot get it wrong.
+**Query and document prompts differ.** EmbeddingGemma uses `task: search result | query: ...` for queries and `title: none | text: ...` for documents. Swapping them **degrades retrieval silently** — nothing errors, results just get worse. Expose only `embed_query()` / `embed_documents()`, each pinning its own template, so no caller can choose wrong.
+
+**Chunk size is a quality choice, not a model limit.** The model accepts 2048 tokens; chunks target ~512 because large chunks dilute the vector — one spanning three separate risk factors averages into something that matches none of them well. ~512 is roughly one named risk factor, the unit users actually ask about. Measure with the model's own tokenizer, never a character-count approximation.
 
 **SEC requires a descriptive `User-Agent`** (`EDGAR_USER_AGENT`, format `"Name email@example.com"`) or it blocks requests. Set it centrally in `app/edgar.py` and rate-limit to ~2–3 req/sec (SEC's ceiling is 10) — never per call site.
 

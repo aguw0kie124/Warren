@@ -17,7 +17,9 @@ dependencies = [
     "beautifulsoup4>=4.12",         # filing HTML -> text
     "lxml>=5.2",                    # fast parser backend for bs4
     "langchain-text-splitters>=0.3", # recursive chunking (standalone, no full langchain)
-    "sentence-transformers>=3.0",   # local embeddings (bge-small-en-v1.5)
+    # 5.0 is a hard floor, not caution: embeddinggemma-300m's architecture is
+    # unrecognized by earlier releases and fails at load, not at install.
+    "sentence-transformers>=5.0",   # local embeddings (embeddinggemma-300m)
 ]
 
 # Modules B/C/D deps (langgraph, langchain-anthropic, fastapi, tavily) get added

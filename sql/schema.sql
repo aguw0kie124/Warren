@@ -28,9 +28,9 @@ CREATE TABLE IF NOT EXISTS chunks (
     section          text NOT NULL,                 -- 'Item 1A Risk Factors'
     content          text NOT NULL,
 
-    -- 384 dims = BAAI/bge-small-en-v1.5. If you swap embedding models, this
+    -- 768 dims = google/embeddinggemma-300m. If you swap embedding models, this
     -- dimension must change with it (see app/config.py::embedding_dim).
-    embedding        vector(384),
+    embedding        vector(768),
 
     -- GENERATED = Postgres maintains the full-text vector automatically on every
     -- insert/update. A8's hybrid search therefore needs zero extra ingestion
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     UNIQUE (accession_number, chunk_index)
 );
 
--- Dense retrieval (A7). Cosine ops to match the normalized bge embeddings.
+-- Dense retrieval (A7). Cosine ops to match the normalized EmbeddingGemma vectors.
 CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw_idx
     ON chunks USING hnsw (embedding vector_cosine_ops);
 
