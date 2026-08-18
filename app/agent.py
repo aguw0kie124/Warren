@@ -21,6 +21,11 @@ C3 adds two things to *how* the model is called, neither of which changes what
 the graph does: a prompt-cache breakpoint on the system + tools prefix, and a
 retry policy on the `agent` node alone. See `_system_message()` and
 `RETRY_POLICY`.
+
+C4a adds one more, on the same principle: a context-window guard that elides
+the bodies of old tool results on the way into the model, so a long multi-hop
+run stops re-sending every passage it has ever retrieved. See
+`trim_tool_results()`.
 """
 
 import logging
@@ -28,7 +33,13 @@ from typing import Annotated, TypedDict
 
 import anthropic
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    AnyMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -88,9 +99,10 @@ Write for someone who reads financial documents. Be specific and quantitative wh
 # check_agent.py` reports the inert case by name rather than failing on it.
 #
 # **No message-level breakpoint.** A second one on the last message would cache
-# the conversation itself, but C4's context guard rewrites that history —
-# invalidating it exactly when the conversation has grown long enough for the
-# caching to have mattered. This one is always valid.
+# the conversation itself, but C4a's `trim_tool_results` rewrites that history
+# — invalidating it exactly when the conversation has grown long enough for the
+# caching to have mattered. This one sits ahead of the messages, so the guard
+# cannot touch it.
 def _system_message() -> SystemMessage:
     """The system prompt as a single cache-marked content block.
 
@@ -133,6 +145,147 @@ RETRY_POLICY = RetryPolicy(
         anthropic.APIConnectionError,
     ),
 )
+
+
+# C4a · Context-window guard.
+#
+# `search_filings` allows k=12 passages of ~512 tokens each, and
+# RECURSION_LIMIT permits roughly a dozen tool calls. A comparison question can
+# therefore push 70k+ tokens of filing text into the conversation — and every
+# later turn re-sends all of it, so cost grows quadratically inside a loop
+# designed to be cheap.
+#
+# Three decisions, each load-bearing:
+#
+# **Bodies are truncated; messages are never dropped.** Dropping is what
+# `trim_messages` does, and it risks orphaning a ToolMessage from the
+# AIMessage that requested it — which Anthropic rejects outright. Truncating
+# in place preserves every `tool_call_id` pairing by construction, so the
+# guard cannot produce an invalid conversation no matter what it elides.
+#
+# **Only ToolMessages are touched.** The model's own messages *are* its
+# reasoning over the passages being elided; keeping them is what makes eliding
+# the passages affordable. The human turn is never touched either.
+#
+# **The trim is applied to the invoke payload, not to state.** `agent_node`
+# recomputes it from the full history every turn, so it is idempotent, never
+# compounds, and leaves `state["messages"]` — and C4b's checkpoint of it —
+# holding the real conversation. Citations are unaffected for the same reason:
+# they live in `state["citations"]`, harvested from artifacts before this runs.
+# That separation, built in C1 for an unrelated reason, is what makes trimming
+# safe at all.
+
+# Measured in characters at 4 per token, deliberately. An exact count means
+# either an API round-trip per turn (`count_tokens` is free but is still a
+# network call inside the loop) or a second tokenizer that has to agree with
+# Anthropic's. This decision needs an order of magnitude, not a number: being
+# 20% off moves where the guard engages, not whether it is correct.
+TOOL_RESULT_BUDGET_TOKENS = 16_000
+CHARS_PER_TOKEN = 4
+
+# The most recent rounds stay verbatim — the model has not finished reasoning
+# over them. A "round" is one AIMessage carrying tool calls plus every
+# ToolMessage answering it, so parallel calls in one turn are kept or elided
+# together. This makes the budget a target rather than a guarantee: two recent
+# k=12 searches can exceed it on their own, and should.
+KEEP_RECENT_TOOL_ROUNDS = 2
+
+# Below this, eliding costs more in confusion than it saves in tokens — a
+# quote, an error sentence, or a corpus-gap notice is nearly all signal.
+MIN_ELIDABLE_CHARS = 400
+
+
+def content_chars(content) -> int:
+    """Length of a message body, whether it is a string or content blocks."""
+    if isinstance(content, str):
+        return len(content)
+    return sum(
+        len(block.get("text", "")) if isinstance(block, dict) else len(str(block))
+        for block in content or []
+    )
+
+
+def tool_result_chars(messages: list[AnyMessage]) -> int:
+    """Total characters of tool-result text in a conversation.
+
+    The quantity the guard bounds, and the one worth watching: everything else
+    in the prompt is bounded by the question and the model's own brevity.
+    """
+    return sum(
+        content_chars(message.content)
+        for message in messages
+        if isinstance(message, ToolMessage)
+    )
+
+
+def _protected_tool_call_ids(messages: list[AnyMessage], keep_rounds: int) -> set[str]:
+    """The `tool_call_id`s belonging to the last `keep_rounds` tool rounds."""
+    protected: set[str] = set()
+    rounds = 0
+    for message in reversed(messages):
+        if isinstance(message, AIMessage) and getattr(message, "tool_calls", None):
+            rounds += 1
+            if rounds > keep_rounds:
+                break
+            protected.update(
+                call["id"] for call in message.tool_calls if call.get("id")
+            )
+    return protected
+
+
+def _elision_stub(message: ToolMessage, size: int) -> str:
+    """What replaces an elided body — said plainly, in the model's own frame."""
+    return (
+        f"[Earlier {message.name or 'tool'} result omitted to conserve context "
+        f"({size:,} characters) — you have already read it. Its sources are "
+        f"recorded and still appear in the answer's citation list.]"
+    )
+
+
+def trim_tool_results(messages: list[AnyMessage]) -> list[AnyMessage]:
+    """Elide old tool-result bodies until the conversation fits the budget.
+
+    Returns a new list; the input and its messages are left untouched. Oldest
+    first, skipping the recent rounds and anything too small to be worth
+    eliding, stopping the moment the total is back under budget — so a run that
+    barely crosses the line loses one passage set, not all of them.
+
+    Under budget, the original list is returned unchanged, which is the case
+    for every question that does not fan out.
+    """
+    budget = TOOL_RESULT_BUDGET_TOKENS * CHARS_PER_TOKEN
+    total = tool_result_chars(messages)
+    if total <= budget:
+        return list(messages)
+
+    protected = _protected_tool_call_ids(messages, KEEP_RECENT_TOOL_ROUNDS)
+    trimmed = list(messages)
+    elided = 0
+    freed = 0
+
+    for index, message in enumerate(trimmed):
+        if total <= budget:
+            break
+        if not isinstance(message, ToolMessage) or message.tool_call_id in protected:
+            continue
+        size = content_chars(message.content)
+        if size < MIN_ELIDABLE_CHARS:
+            continue
+        stub = _elision_stub(message, size)
+        trimmed[index] = message.model_copy(update={"content": stub})
+        total -= size - len(stub)
+        elided += 1
+        freed += size - len(stub)
+
+    if elided:
+        logger.info(
+            "context guard: elided %d old tool result(s), ~%d tokens, "
+            "leaving ~%d tokens of tool text",
+            elided,
+            freed // CHARS_PER_TOKEN,
+            total // CHARS_PER_TOKEN,
+        )
+    return trimmed
 
 
 def merge_citations(
@@ -218,8 +371,15 @@ def agent_node(state: AgentState) -> dict:
     The system prompt is prepended per call rather than stored in state, which
     keeps it out of the conversation the model sees itself as having written
     and keeps the cacheable prefix identical on every turn.
+
+    The context guard runs here rather than in a `pre_model_hook`: this graph
+    is hand-built rather than `create_react_agent`, so there is no hook slot,
+    and a plain call at the top of the node is both simpler and more honest
+    about when it runs. It rewrites only what goes to the model — what comes
+    back into state is one message, so the stored history stays whole.
     """
-    response = get_llm().invoke([_system_message(), *state["messages"]])
+    messages = trim_tool_results(state["messages"])
+    response = get_llm().invoke([_system_message(), *messages])
     logger.debug(
         "agent turn: %d tool call(s), %s",
         len(getattr(response, "tool_calls", []) or []),

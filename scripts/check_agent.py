@@ -2,6 +2,7 @@
 
     python scripts/check_agent.py                    # the benchmark set
     python scripts/check_agent.py --only 3 4         # just the news/web pair
+    python scripts/check_agent.py --guard            # C4a's context guard alone
     python scripts/check_agent.py --ask "..."        # one ad-hoc question
     python scripts/check_agent.py --quiet            # verdicts only, no answers
 
@@ -34,6 +35,13 @@ error when it stops working — it only changes the bill — so the per-turn
 check that reads it, are the only place the breakpoint is observable at all.
 The retry policy is covered offline in tests/test_agent.py, since making a
 real provider return 529 on demand is not something a gate can arrange.
+
+C4a is `--guard`, a separate mode rather than a seventh benchmark question.
+Its question is deliberately expensive — six k=12 searches, ~150k characters
+of filing text — and the benchmark set should stay cheap enough to re-run
+freely. It is also the one check here whose evidence is arithmetic rather than
+judgement: history only ever grows, so a prompt that gets *smaller* between
+turns cannot happen without the guard.
 """
 
 import argparse
@@ -98,6 +106,18 @@ BENCHMARK = [
 # response with zeroes in the cache columns, which is exactly what the numbers
 # below exist to make visible.
 CACHE_MINIMUM_TOKENS = 4096 if "haiku" in settings.anthropic_model else 1024
+
+# C4a · The question the context guard exists for, and it is not subtle: three
+# companies × two fiscal years at the maximum k, which is ~150k characters of
+# filing text against a ~64k budget. The instruction to retrieve 12 passages is
+# in the question on purpose — the guard is what makes a heavy question
+# affordable, so the gate has to ask a heavy one rather than hope for it.
+GUARD_QUESTION = (
+    "Compare the risk factors Apple, Microsoft and Meta each disclosed in "
+    "their two most recent 10-K filings, and say what changed year over year "
+    "for each company. Retrieve 12 passages per search so the comparison is "
+    "thorough."
+)
 
 # Question 6 only: the answer has to admit the gap rather than paper over it.
 GAP_MARKERS = ("not in the", "not been ingested", "not available", "no filings",
@@ -286,6 +306,79 @@ def check_prompt_cache(state: dict) -> None:
     )
 
 
+def prompt_tokens(row: dict) -> int:
+    """What a turn actually sent. `input` alone omits the part read from cache."""
+    return row["input"] + row["cache_read"] + row["cache_creation"]
+
+
+def check_context_guard(state: dict) -> None:
+    """C4a's only observable, and the arithmetic is what makes it one.
+
+    A conversation only ever grows, so without the guard every turn's prompt is
+    at least as large as the last. **A prompt that shrinks between turns is
+    therefore proof the guard fired** — no estimate, no token-counting
+    approximation, nothing to argue with. The rest is confirming it took only
+    what it was supposed to: tool bodies, out of the payload, never out of
+    state, and never a citation.
+    """
+    rule("context-window guard (C4a)")
+    messages = state.get("messages", [])
+    rows = agent.token_usage(messages)
+
+    stored = agent.tool_result_chars(messages)
+    # What the *next* turn would send — i.e. exactly what the last turn sent,
+    # since the guard recomputes from the full history every time.
+    trimmed = agent.trim_tool_results(messages)
+    elided = sum(
+        1 for m in trimmed
+        if getattr(m, "type", "") == "tool" and "omitted to conserve context" in str(m.content)
+    )
+
+    print(f"  tool-result text in state: {stored:,} chars "
+          f"(~{stored // agent.CHARS_PER_TOKEN:,} tokens) against a "
+          f"{agent.TOOL_RESULT_BUDGET_TOKENS:,}-token budget")
+    print(f"  prompt per turn (tokens):  "
+          f"{' → '.join(f'{prompt_tokens(row):,}' for row in rows)}")
+
+    if not elided:
+        print("  [-- ] not exercised: the run never crossed the budget, so the guard "
+              "had nothing\n         to do. That is the correct behaviour for a light "
+              "question — but it means\n         this run proves nothing about the "
+              "guard. Ask something heavier.")
+        return
+
+    print(f"  elided {elided} old tool result(s) from the last turn's payload")
+
+    peak = max(prompt_tokens(row) for row in rows)
+    shrank = [
+        i for i in range(1, len(rows))
+        if prompt_tokens(rows[i]) < prompt_tokens(rows[i - 1])
+    ]
+    verdict(
+        bool(shrank),
+        f"the prompt shrank between turns (at turn {shrank[0] + 1 if shrank else '—'}), "
+        f"which only trimming can do — peak {peak:,} tokens",
+    )
+
+    # The guard rewrites the invoke payload, not the conversation. If a stub
+    # ever reaches state, C4b's checkpointer persists it and the elision
+    # becomes permanent rather than per-turn.
+    leaked = [
+        m for m in messages
+        if getattr(m, "type", "") == "tool" and "omitted to conserve context" in str(m.content)
+    ]
+    label = "state still holds the untrimmed conversation"
+    verdict(not leaked, label + (f" ({len(leaked)} stub(s) leaked into it)" if leaked else ""))
+
+    # Citations live outside the messages, which is the whole reason trimming
+    # is safe: eliding the passage must not cost the source it came from.
+    filings = [c for c in state.get("citations", []) if c.type == "filing"]
+    years = sorted({year for c in filings for year in re.findall(r"\b20\d{2}\b", c.label)})
+    verdict(bool(filings), f"filing citations survived the trim ({len(filings)} of them)")
+    print(f"    filing years cited: {', '.join(years) or 'none'} — the answer "
+          "should still compare both")
+
+
 def check_citation_urls(state: dict) -> None:
     """Fetch the filing citations from one run — a citation nobody can open is not one.
 
@@ -326,6 +419,8 @@ def configure() -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", type=int, nargs="*", help="benchmark numbers to run (1-6)")
+    ap.add_argument("--guard", action="store_true",
+                    help="run C4a's heavy question and check the context guard")
     ap.add_argument("--ask", help="run one ad-hoc question instead of the set")
     ap.add_argument("--quiet", action="store_true", help="verdicts only, no answer text")
     args = ap.parse_args()
@@ -335,7 +430,20 @@ def main() -> None:
     last_state: dict = {}
     cache_state: dict = {}
     try:
-        if args.ask:
+        if args.guard:
+            # One question, and the summary below still runs — the guard's
+            # verdicts are counted like any other, and the answer is printed
+            # because "did it still compare both years" is a human reading.
+            rule(f"C4a · {GUARD_QUESTION}")
+            state = run_streaming(GUARD_QUESTION)
+            answer = agent.final_text(state["messages"])
+            print_usage(state)
+            check_context_guard(state)
+            check_citation_urls(state)
+            if not args.quiet:
+                print(f"\n{indent(answer)}")
+
+        elif args.ask:
             rule(args.ask)
             state = run_streaming(args.ask)
             called = {name for name, _ in agent.tool_calls_made(state["messages"])}
@@ -346,21 +454,22 @@ def main() -> None:
                 print(f"      [{citation.type}] {citation.label}\n          {citation.source_url}")
             return
 
-        for i, (question, required, forbidden) in enumerate(BENCHMARK, start=1):
-            if args.only and i not in args.only:
-                continue
-            state = check_question(i, question, required, forbidden, args.quiet)
-            # Keep the first run that produced filing citations, so the URL
-            # check below costs nothing extra.
-            if not last_state and any(c.type == "filing" for c in state.get("citations", [])):
-                last_state = state
-            # And the first multi-turn run, which is the only kind that can
-            # show a cache read: turn 1 can only ever create.
-            if not cache_state and len(agent.token_usage(state["messages"])) > 1:
-                cache_state = state
+        else:
+            for i, (question, required, forbidden) in enumerate(BENCHMARK, start=1):
+                if args.only and i not in args.only:
+                    continue
+                state = check_question(i, question, required, forbidden, args.quiet)
+                # Keep the first run that produced filing citations, so the URL
+                # check below costs nothing extra.
+                if not last_state and any(c.type == "filing" for c in state.get("citations", [])):
+                    last_state = state
+                # And the first multi-turn run, which is the only kind that can
+                # show a cache read: turn 1 can only ever create.
+                if not cache_state and len(agent.token_usage(state["messages"])) > 1:
+                    cache_state = state
 
-        check_citation_urls(last_state)
-        check_prompt_cache(cache_state)
+            check_citation_urls(last_state)
+            check_prompt_cache(cache_state)
 
         rule("summary")
         if FAILURES:

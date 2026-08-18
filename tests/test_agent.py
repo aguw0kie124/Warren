@@ -11,12 +11,17 @@ collected, nothing errors — the answers still read fine, they just quietly
 lose their sources. C3's two additions fail the same way: a cache breakpoint
 that stops being sent costs money and changes no output, and a retry policy is
 only observable when the provider is failing.
+
+C4a's guard is the opposite risk — it is the one piece here that *removes*
+text from the model's view, so its tests are mostly about restraint: that it
+leaves a short conversation alone, that it never drops a message, and that
+what it does elide is the oldest tool output and nothing else.
 """
 
 import anthropic
 import httpx
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from app import agent
 from app.agent import AgentState, Citation, merge_citations, tool_calls_made
@@ -325,6 +330,172 @@ def test_only_the_agent_node_is_retried(graph):
     over failures C1 deliberately returns as text rather than raising."""
     assert agent.RETRY_POLICY in graph.nodes["agent"].retry_policy
     assert graph.nodes["tools"].retry_policy is None
+
+
+# --- C4a · context guard ----------------------------------------------------
+
+
+BUDGET_CHARS = agent.TOOL_RESULT_BUDGET_TOKENS * agent.CHARS_PER_TOKEN
+
+
+def conversation(rounds: int, chars: int = 20_000) -> list:
+    """A synthetic multi-hop run: `rounds` search calls, each answered at length."""
+    messages: list = [HumanMessage("Compare the last two 10-Ks.")]
+    for i in range(rounds):
+        messages.append(
+            AIMessage("", tool_calls=[tool_call("search_filings", {"query": f"q{i}"}, f"c{i}")])
+        )
+        messages.append(
+            ToolMessage(
+                content=f"passage {i} " + "x" * chars,
+                tool_call_id=f"c{i}",
+                name="search_filings",
+            )
+        )
+    return messages
+
+
+def elided(messages: list) -> list[int]:
+    """Indices of the tool results the guard replaced with a stub."""
+    return [
+        i
+        for i, m in enumerate(messages)
+        if isinstance(m, ToolMessage) and "omitted to conserve context" in m.content
+    ]
+
+
+def test_a_conversation_under_budget_is_untouched():
+    """The common case. Nothing is elided until there is a reason."""
+    messages = conversation(2)
+    assert agent.tool_result_chars(messages) < BUDGET_CHARS
+    assert [m.content for m in agent.trim_tool_results(messages)] == [
+        m.content for m in messages
+    ]
+
+
+def test_the_oldest_tool_results_are_elided_over_budget():
+    messages = conversation(5)  # ~100k chars against a ~64k budget
+    assert agent.tool_result_chars(messages) > BUDGET_CHARS
+
+    trimmed = agent.trim_tool_results(messages)
+
+    assert elided(trimmed) == [2, 4]  # the first two tool results, in order
+    assert agent.tool_result_chars(trimmed) <= BUDGET_CHARS
+
+
+def test_it_stops_as_soon_as_it_is_back_under_budget():
+    """A run that barely crosses the line loses one passage set, not all of them."""
+    trimmed = agent.trim_tool_results(conversation(4))
+    assert elided(trimmed) == [2]
+
+
+def test_the_recent_rounds_are_never_elided():
+    """The model has not finished reasoning over them — eliding those is the
+    one way this guard could change an answer rather than only its price."""
+    trimmed = agent.trim_tool_results(conversation(8))
+    stubbed = {trimmed[i].tool_call_id for i in elided(trimmed)}
+    assert agent.KEEP_RECENT_TOOL_ROUNDS == 2
+    assert not {"c6", "c7"} & stubbed
+
+
+def test_no_message_is_dropped_and_every_pairing_survives():
+    """Dropping messages — what trim_messages does — can orphan a ToolMessage
+    from the AIMessage that requested it, which Anthropic rejects outright."""
+    messages = conversation(6)
+    trimmed = agent.trim_tool_results(messages)
+
+    assert len(trimmed) == len(messages)
+    assert [type(m) for m in trimmed] == [type(m) for m in messages]
+    assert [m.tool_call_id for m in trimmed if isinstance(m, ToolMessage)] == [
+        m.tool_call_id for m in messages if isinstance(m, ToolMessage)
+    ]
+    # Every remaining tool result still answers a call that is still present.
+    requested = {
+        call["id"] for m in trimmed if isinstance(m, AIMessage) for call in m.tool_calls
+    }
+    assert all(
+        m.tool_call_id in requested for m in trimmed if isinstance(m, ToolMessage)
+    )
+
+
+def test_the_input_messages_are_not_mutated():
+    """The trimmed list goes to the model; state keeps the real conversation."""
+    messages = conversation(6)
+    before = [m.content for m in messages]
+
+    agent.trim_tool_results(messages)
+
+    assert [m.content for m in messages] == before
+
+
+def test_only_tool_messages_are_elided():
+    """The model's own turns are its reasoning over the passages being elided —
+    keeping them is what makes eliding the passages affordable."""
+    messages = conversation(6)
+    messages.insert(1, AIMessage("A long reasoning turn. " * 2_000))
+
+    trimmed = agent.trim_tool_results(messages)
+
+    changed = [new for new, old in zip(trimmed, messages) if new.content != old.content]
+    assert changed and all(isinstance(m, ToolMessage) for m in changed)
+    assert trimmed[1].content == messages[1].content  # the long AI turn, intact
+
+
+def test_short_tool_results_are_left_alone():
+    """A failure sentence or a corpus-gap notice is nearly all signal — eliding
+    it costs more in confusion than it saves in tokens."""
+    messages = conversation(5)
+    messages[2] = ToolMessage(
+        content="CORPUS GAP: NVDA is not in the filings corpus.",
+        tool_call_id="c0",
+        name="search_filings",
+    )
+
+    trimmed = agent.trim_tool_results(messages)
+
+    # Skipped even though it is the oldest candidate: had it been elided, the
+    # stub would be *longer* than what it replaced and the loop would have gone
+    # on to elide index 6 as well.
+    assert trimmed[2].content == messages[2].content
+    assert elided(trimmed) == [4]
+
+
+def test_the_stub_names_what_was_elided():
+    messages = conversation(5)
+    trimmed = agent.trim_tool_results(messages)
+
+    stub = trimmed[2].content
+    assert "search_filings" in stub
+    assert f"{len(messages[2].content):,}" in stub  # the loss is visible, not silent
+    assert trimmed[2].tool_call_id == "c0"
+
+
+def test_eliding_preserves_the_artifact_that_carried_the_citations():
+    """The elided copy keeps everything but the body — C1's artifact included,
+    so a trimmed run is still a fully sourced one."""
+    messages = conversation(5)
+    sources = [citation()]
+    messages[2] = messages[2].model_copy(update={"artifact": sources})
+
+    trimmed = agent.trim_tool_results(messages)
+
+    assert 2 in elided(trimmed)
+    assert trimmed[2].artifact == sources
+
+
+def test_the_node_sends_the_trimmed_history_and_returns_only_the_reply(scripted):
+    """The guard rewrites the invoke payload, never state: `agent_node` returns
+    one message, so the stored history — and C4b's checkpoint of it — is whole."""
+    messages = conversation(5)
+    model = scripted(AIMessage("done"))
+
+    result = agent.agent_node({"messages": messages, "citations": []})
+
+    sent = model.calls[0][1:]  # past the system message
+    assert len(elided(sent)) == 2
+    assert elided(messages) == []  # the caller's list is untouched
+    assert result["messages"][0].content == "done"
+    assert "citations" not in result
 
 
 # --- citations --------------------------------------------------------------
