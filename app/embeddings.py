@@ -7,8 +7,8 @@ column and settings.embedding_dim it must stay in step with.
 """
 
 import logging
+import threading
 from collections.abc import Sequence
-from functools import lru_cache
 
 from app.config import settings
 
@@ -17,9 +17,39 @@ logger = logging.getLogger(__name__)
 Vector = list[float]
 
 
-@lru_cache(maxsize=1)
+_model = None
+# `lru_cache` memoises but does not serialise: threads that arrive before the
+# first call returns all run the body, so N concurrent callers built N models.
+# That is not hypothetical here — the agent issues parallel `search_filings`
+# calls, ToolNode runs them in threads, and four simultaneous Metal/MPS
+# initialisations segfault the interpreter rather than raising. A plain lock
+# is the fix; the double check keeps it off the hot path.
+_init_lock = threading.Lock()
+
+# Loading once is necessary but not sufficient: concurrent `encode` on one
+# loaded model crashes too (SIGTRAP on MPS), so encoding is serialised as well.
+# Measured, not assumed — fixing only the load race took the repro from 4 model
+# loads to 1 and it still died. The cost is nil in practice: a query embedding
+# is a single short string, and the calls this serialises are already waiting
+# behind an LLM turn and a Postgres round-trip.
+_encode_lock = threading.Lock()
+
+
 def get_model():
-    """Load the encoder once per process (a few seconds, several hundred MB)."""
+    """Load the encoder once per process (a few seconds, several hundred MB).
+
+    Thread-safe: concurrent first-callers block on the lock, and exactly one
+    of them constructs the model.
+    """
+    global _model
+    if _model is None:
+        with _init_lock:
+            if _model is None:
+                _model = _build_model()
+    return _model
+
+
+def _build_model():
     # Imported lazily so that merely importing this module doesn't drag in torch.
     from sentence_transformers import SentenceTransformer
 
@@ -46,20 +76,24 @@ def embed_documents(texts: Sequence[str], batch_size: int = 16) -> list[Vector]:
     """Embed passages for storage."""
     if not texts:
         return []
-    vectors = get_model().encode_document(
-        list(texts),
-        batch_size=batch_size,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
+    model = get_model()
+    with _encode_lock:
+        vectors = model.encode_document(
+            list(texts),
+            batch_size=batch_size,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
     return [v.tolist() for v in vectors]
 
 
 def embed_query(text: str) -> Vector:
     """Embed a search query."""
-    vector = get_model().encode_query(
-        text,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
+    model = get_model()
+    with _encode_lock:
+        vector = model.encode_query(
+            text,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
     return vector.tolist()
