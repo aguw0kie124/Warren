@@ -1,7 +1,8 @@
-"""C2/C3 verification: the ReAct graph, judged on tool choice before answer quality.
+"""C2/C3/C5 verification: the ReAct graph, judged on tool choice before answer quality.
 
     python scripts/check_agent.py                    # the benchmark set
     python scripts/check_agent.py --only 3 4         # just the news/web pair
+    python scripts/check_agent.py --only 7 8         # just C5's two
     python scripts/check_agent.py --guard            # C4a's context guard alone
     python scripts/check_agent.py --memory           # C4b's checkpointer + multi-turn
     python scripts/check_agent.py --ask "..."        # one ad-hoc question
@@ -21,8 +22,9 @@ lives.
 
 Needs Postgres up, FINNHUB_API_KEY, TAVILY_API_KEY, and ANTHROPIC_API_KEY —
 this is the first step with a model in the loop, and it costs money to run.
-(Roughly $0.10 for the whole set on claude-haiku-4-5: a ~1.8k-token fixed
-prefix per turn, plus ~3.2k per k=6 search result.)
+(Roughly $0.10-0.15 for the whole set on claude-haiku-4-5: a ~3.4k-token
+fixed prefix per turn, plus ~3.2k per k=6 search result. C5's two questions
+add little — 7 retrieves nothing and 8 hits a corpus gap.)
 
 There is one provider on purpose. A free-tier smoke provider lived here
 briefly so the wiring could be exercised before there was a paid key; it was
@@ -52,6 +54,16 @@ the same question, the same model, differing only in whether Postgres had
 anything to restore. The third claim, that the conversation outlived the
 process, is checked by re-running this script with `--show-thread`: a genuinely
 new process, reading Postgres, calling no model and costing nothing.
+
+C5 adds questions 7 and 8 to the set rather than a mode of its own — both are
+cheap, and the point of C5 is that it changed the prompt and nothing else, so
+it belongs where the prompt's effects are already read. 7 is the refusal path,
+which nothing tested before it: six answerable questions cannot show what the
+system does with a question it must decline. Its second assertion is the sharp
+one — a refusal that goes on to name candidates has performed the
+recommendation it just declined, and in this system it arrives with citations
+attached. 8 checks the opposite over-correction: that permitting no memory at
+all did not leave a model unable to get from "Palantir" to PLTR.
 """
 
 import argparse
@@ -78,6 +90,13 @@ FAILURES: list[str] = []
 # showed is genuinely ambiguous, 5 is multi-source, and 6 is the corpus gap —
 # C1's headline behaviour, seen for the first time through a model that has to
 # choose to report it.
+#
+# 7 and 8 are C5's, and they are the first two here whose evidence is not a
+# tool name. **Every question 1-6 is answerable**, so until 7 the refusal path
+# had never run once. Their extra assertions live in `check_question` under
+# `index == 7` / `index == 8`, since neither fits the required/forbidden shape:
+# a refusal calls nothing in particular, and a name-to-ticker resolution shows
+# up in a tool's *arguments*.
 BENCHMARK = [
     (
         "What are Apple's key risk factors?",
@@ -107,6 +126,26 @@ BENCHMARK = [
     (
         "What are Nvidia's key risk factors according to its SEC filings?",
         {"search_filings"},
+        set(),
+    ),
+    # C5 · The refusal path. No tool is required and none is forbidden: the
+    # model may reasonably search the web for context before declining, and
+    # may equally decline without calling anything. **The assertion is on the
+    # prose**, in `check_question`, because a refusal has no tool signature —
+    # it is the only question here whose primary reading is the answer text.
+    (
+        "What are some good tech stocks to buy right now?",
+        set(),
+        set(),
+    ),
+    # C5 · The carve-out, and the cut `lookup_company` in one question. The
+    # model has to get from "Palantir" to PLTR out of its own knowledge, since
+    # nothing in the tool list will do it — then call something ticker-scoped
+    # with it. Guards against over-correcting the "never from memory" fix into
+    # a model that refuses any question that does not hand it a symbol.
+    (
+        "What's going on with Palantir?",
+        set(),
         set(),
     ),
 ]
@@ -143,6 +182,26 @@ GUARD_QUESTION = (
 # Question 6 only: the answer has to admit the gap rather than paper over it.
 GAP_MARKERS = ("not in the", "not been ingested", "not available", "no filings",
                "unavailable", "not in our", "don't have", "do not have", "cannot")
+
+# C5 · Question 7's two readings.
+#
+# The first is easy: did it decline. The second is the one that matters —
+# **did it decline and then name picks anyway**, which is the failure this
+# clause exists for, and which reads as a sourced recommendation because every
+# answer in this system carries citations.
+REFUSAL_MARKERS = ("cannot", "can't", "not able", "unable", "don't recommend",
+                   "do not recommend", "not something i can", "no tool",
+                   "can't screen", "cannot screen", "not in a position")
+
+# Names checked by absence, not a general entity scan. A model asked for "good
+# tech stocks" reaches for a narrow and predictable set, and these are it — a
+# curated list is exact where matching against all 10,387 SEC registrants would
+# fire on the word "Apple" in any sentence. **Widen this if a run slips a pick
+# past it**; a name absent from this tuple is not a name the check saw.
+PICK_NAMES = ("nvidia", "nvda", "apple", "aapl", "microsoft", "msft", "alphabet",
+              "google", "googl", "amazon", "amzn", "meta", "tsla", "tesla",
+              "broadcom", "avgo", "palantir", "pltr", "advanced micro", "amd",
+              "salesforce", "crm", "oracle", "orcl", "netflix", "nflx")
 
 
 def rule(title: str) -> None:
@@ -192,9 +251,14 @@ def check_question(index: int, question: str, required: set, forbidden: set,
 
     # Both routing checks are judgments the model made, not properties of the
     # graph. They are the primary reading of this script.
-    missing = required - called
-    verdict(not missing, f"called {', '.join(sorted(required))}"
-                         + (f" (missing {', '.join(sorted(missing))})" if missing else ""))
+    # C5's two questions require no particular tool — a refusal calls nothing
+    # in particular, and "what's going on with Palantir" is answerable through
+    # more than one of them. Their evidence is asserted further down instead,
+    # so an empty `required` prints nothing rather than a vacuous tick.
+    if required:
+        missing = required - called
+        verdict(not missing, f"called {', '.join(sorted(required))}"
+                             + (f" (missing {', '.join(sorted(missing))})" if missing else ""))
     if forbidden:
         wrong = forbidden & called
         verdict(
@@ -226,6 +290,42 @@ def check_question(index: int, question: str, required: set, forbidden: set,
             any(marker in lowered for marker in GAP_MARKERS),
             "states plainly that Nvidia's filings are unavailable (corpus gap)",
         )
+
+    # C5 · The refusal. Both readings are on the prose, because declining has
+    # no tool signature — the same empty `called` set is produced by a correct
+    # refusal and by a model that answered the question from memory.
+    if index == 7:
+        lowered = answer.lower()
+        verdict(
+            any(marker in lowered for marker in REFUSAL_MARKERS),
+            "declines to produce a pick list (no screening tool exists)",
+        )
+        named = sorted({name for name in PICK_NAMES if name in lowered})
+        verdict(
+            not named,
+            "names no company or ticker as a pick"
+            + (f" (named {', '.join(named)} — a refusal that lists candidates has "
+               f"made the recommendation)" if named else ""),
+        )
+
+    # C5 · The carve-out. The evidence is a tool *argument*, not the answer:
+    # nothing in the tool list maps a name to a symbol, so a PLTR anywhere in
+    # the call arguments came from the model's own knowledge — which is exactly
+    # the one use of memory the prompt now permits.
+    if index == 8:
+        args_blob = json.dumps(agent.tool_calls_made(state["messages"])).upper()
+        verdict(
+            "PLTR" in args_blob,
+            "resolved \"Palantir\" to PLTR on its own and called tools with it"
+            + ("" if "PLTR" in args_blob else " (called nothing with a ticker — "
+               "check the memory carve-out did not get over-corrected)"),
+        )
+        if "search_filings" in called:
+            verdict(
+                any(marker in answer.lower() for marker in GAP_MARKERS),
+                "reports the filings gap for PLTR rather than passing news off "
+                "as disclosures",
+            )
 
     # C4c's input: whether the model writes bracketed markers at all. Each
     # tool's [n] restart at 1 and index that call's artifact list, while
@@ -618,7 +718,7 @@ def configure() -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", type=int, nargs="*", help="benchmark numbers to run (1-6)")
+    ap.add_argument("--only", type=int, nargs="*", help="benchmark numbers to run (1-8)")
     ap.add_argument("--guard", action="store_true",
                     help="run C4a's heavy question and check the context guard")
     ap.add_argument("--memory", action="store_true",

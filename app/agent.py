@@ -65,7 +65,42 @@ logger = logging.getLogger(__name__)
 # spending money quietly.
 RECURSION_LIMIT = 25
 
-SYSTEM_PROMPT = """You are a financial research assistant. You answer questions about public companies using SEC filings, live market data, and the financial web — never from memory.
+# C5 · Scope, refusal, and the one thing the model may use its own memory for.
+#
+# Three clauses, and the first is a correction rather than an addition. The
+# original opening forbade answering "from memory" without qualification —
+# which, read literally, forbids knowing that Palantir trades as PLTR, and so
+# refuses ticker-less questions for entirely the wrong reason. C5 as planned
+# solved that with a `lookup_company` tool; that tool is **cut**, on the
+# grounds that `company_tickers.json` is a registry and not a semantic index
+# (it resolves "Apple", never "the iPhone maker"), so the model was always
+# going to be the thing that recognised the company. What a sixth tool would
+# have added is routing risk against C2's 20/20 gate and a turn on questions
+# that already work. An invented ticker already dies in the tool layer:
+# `UnknownSymbolError` from Finnhub, a corpus gap from `search_filings`.
+#
+# So the carve-out is the load-bearing part: **recognise an entity, assert
+# nothing about it.** The tool that receives the ticker is the verifier.
+#
+# The other two clauses exist for the failure this system is shaped to
+# produce: "what are some good tech stocks" has no ticker in it, no tool takes
+# a criterion, and the path of least resistance is `web_search` returning a
+# listicle — which arrives wearing resolving citations and reads as audited.
+# The refusal names the boundary and offers the answerable question.
+#
+# **It must not name example companies while doing so**, which is why that is
+# said twice here. A refusal that lists candidates has performed the
+# recommendation it declined, with the house style making it look sourced.
+#
+# Coverage is deliberately *not* enumerated in this prompt. Injecting
+# `_covered_tickers()` would put a Postgres read inside `_system_message()`,
+# which runs every turn, and make C3's cacheable prefix depend on the contents
+# of a table. C1's corpus-gap text already reports coverage at the point a
+# company is actually named, which is the only point it is useful.
+
+SYSTEM_PROMPT = """You are a financial research assistant. You answer questions about public companies using SEC filings, live market data, and the financial web.
+
+You may use your own knowledge for exactly one thing: **recognising which company a question is about** and naming its ticker, so a tool can be called with it. "Palantir" is PLTR; the tool that receives it is what verifies that. Every *fact* — a number, a date, a risk, a quote, an event — comes from a tool result and never from memory. Recognising an entity is allowed; asserting anything about it is not.
 
 Sourcing discipline, in order of priority:
 
@@ -84,7 +119,15 @@ Choosing tools:
 
 Call tools in parallel when the question has independent parts, and call the same tool more than once when a comparison needs it (for example one `search_filings` per fiscal year). If a tool reports a failure, tell the reader what was unavailable rather than working around it silently.
 
-There is **no price history** available: nothing can answer "how has the stock moved since the 10-K". Say that plainly if asked.
+What this system cannot do:
+
+- **It answers questions about companies you name. It cannot screen, rank, or scan a universe** — there is no tool that takes a criterion ("cheap", "strong margins", "undervalued") and returns a list of companies matching it. Every tool takes a ticker.
+- **It does not recommend what to buy, sell, or hold**, and does not rank companies as investments.
+- **There is no price history**: nothing can answer "how has the stock moved since the 10-K". Say that plainly if asked.
+
+So for "what are some good tech stocks", "what should I buy", "find me undervalued names" and anything else that asks for a list you were not given: **say plainly that you cannot produce it, say why, and offer the version that is answerable** — name a company and its filings, news, market data and metrics can be researched. You may say what generally distinguishes a strong company in a sector (revenue growth, margin trend, leverage) since that is definitional rather than a claim about anyone.
+
+**Do not name example companies in that redirect.** A refusal that then lists candidates has done the thing it just declined to do, and in this system every answer carries citations, so a name offered in passing reads as a sourced recommendation. Naming a company is the user's move, not yours.
 
 Write for someone who reads financial documents. Be specific and quantitative where the sources are, brief where they are not, and never pad an answer to look thorough."""
 
@@ -92,9 +135,9 @@ Write for someone who reads financial documents. Be specific and quantitative wh
 #
 # Anthropic's cacheable prefix is ordered **tools → system → messages**, so a
 # single breakpoint here also covers the five tool schemas sitting ahead of it:
-# together a fixed ~3.0k-token prefix (2.4k of tool schema, 0.6k of prompt)
-# that is re-sent on every iteration of a loop a multi-hop question goes around
-# five or six times.
+# together a fixed ~3.4k-token prefix (2.4k of tool schema, ~1.0k of prompt
+# after C5 widened it) that is re-sent on every iteration of a loop a
+# multi-hop question goes around five or six times.
 #
 # This only works because `agent_node` prepends the prompt per call instead of
 # storing it in state — the prefix is byte-identical every turn, which is the
@@ -102,9 +145,11 @@ Write for someone who reads financial documents. Be specific and quantitative wh
 #
 # **On the pinned Haiku model it is currently inert**, and knowingly so: that
 # model ignores a breakpoint under 4096 tokens (measured — the docs say 2048),
-# which 3.0k does not clear. Nothing is raised; the cache columns just read
-# zero. The breakpoint stays because it is correct, costs nothing, and starts
-# paying the moment the prefix grows or the model changes. `scripts/
+# which ~3.4k does not clear. C5 moved it meaningfully closer, so the next
+# clause added to the prompt may well flip this on; nothing is raised either
+# way, and when it is ignored the cache columns simply read zero. The
+# breakpoint stays because it is correct, costs nothing, and starts paying the
+# moment the prefix clears the floor or the model changes. `scripts/
 # check_agent.py` reports the inert case by name rather than failing on it.
 #
 # **No message-level breakpoint.** A second one on the last message would cache

@@ -686,6 +686,68 @@ def test_nothing_touches_postgres_until_a_checkpointed_graph_is_asked_for(monkey
     agent.build_graph()  # no checkpointer asked for, so no connection
 
 
+# --- C5 · scope and refusal -------------------------------------------------
+#
+# C5 is prompt text, and prompt text is not unit-testable: whether the model
+# actually declines to pick stocks is `check_agent.py`'s question 7, against a
+# real model, and nothing here can stand in for it.
+#
+# What *is* testable is the two structural claims C5 makes about itself — that
+# it added no tool, and that it did not leave the "never from memory" opener
+# in place while adding a carve-out that contradicts it. Both are the kind of
+# thing a later edit undoes by accident, and neither shows up as a failure
+# anywhere else: a re-tightened opener produces refusals that look like model
+# behaviour, and a sixth tool produces a routing regression attributed to the
+# docstrings.
+
+
+def test_c5_added_no_tools():
+    """The bound tool list is unchanged, which is the whole claim of C5's scoping.
+
+    `lookup_company` was cut precisely so C2's routing gate and C3's cache
+    prefix would still describe the shipped system. A sixth entry here
+    invalidates both, quietly.
+    """
+    names = {tool.name for tool in agent.TOOLS}
+    assert len(agent.TOOLS) == 5
+    assert "lookup_company" not in names
+
+
+def test_the_prompt_separates_recognising_a_company_from_asserting_about_it():
+    """The carve-out is present, and the unqualified prohibition is gone.
+
+    The original opening forbade answering "from memory" full stop, which read
+    literally forbids knowing that Palantir trades as PLTR — the one thing the
+    model now has to do unaided, since no tool maps a name to a symbol.
+    """
+    prompt = agent.SYSTEM_PROMPT
+    assert "financial web — never from memory" not in prompt
+    assert "Recognising an entity is allowed; asserting anything about it is not." in prompt
+    assert "never from memory" in prompt  # still forbidden, for facts
+
+
+def test_the_prompt_states_the_screening_boundary():
+    """Scope clause and redirect, the pair question 7 reads."""
+    prompt = agent.SYSTEM_PROMPT
+    assert "cannot screen, rank, or scan a universe" in prompt
+    assert "does not recommend what to buy, sell, or hold" in prompt
+    assert "Do not name example companies" in prompt
+
+
+def test_the_prompt_enumerates_no_tickers():
+    """Coverage is reported by the corpus-gap text, not baked into the prefix.
+
+    Injecting `_covered_tickers()` here would put a Postgres read in
+    `_system_message()` — which runs every turn — and make C3's cacheable
+    prefix depend on the contents of a table.
+    """
+    prompt = agent.SYSTEM_PROMPT
+    assert "MSFT" not in prompt and "TSLA" not in prompt
+    assert "AAPL" not in prompt
+    # "Apple" itself does appear, in the worked example of how to date a
+    # filing claim. That is formatting, not a coverage list.
+
+
 # --- citations --------------------------------------------------------------
 
 
