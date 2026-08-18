@@ -35,6 +35,13 @@ dependencies = [
     # the line the retry policy was verified against.
     "langgraph>=1.0",
     "langchain-anthropic>=0.3",
+    # C4b's checkpointer. A separate distribution from the `langgraph-checkpoint`
+    # that arrives transitively with langgraph — that one carries the base classes
+    # and the in-memory saver; only this one carries PostgresSaver.
+    # 3.1 is a real floor: the serializer's `allowed_msgpack_modules` argument,
+    # which is how app/agent.py registers Citation for checkpoint round-trips,
+    # does not exist in the 2.x line.
+    "langgraph-checkpoint-postgres>=3.1",
     # Already present underneath langchain-anthropic; declared because C3
     # imports its exception classes by name for the agent node's retry policy,
     # and a transitive dependency is not a promise about what it exports.

@@ -60,6 +60,20 @@ def get_conn() -> Iterator[Connection]:
         yield conn
 
 
+@contextmanager
+def autocommit_conn() -> Iterator[Connection]:
+    """A short-lived connection outside the pool, in autocommit mode.
+
+    For the DDL Postgres refuses to run inside a transaction block —
+    `CREATE INDEX CONCURRENTLY`, which LangGraph's checkpointer migrations use
+    (C4b). The pool's connections are transactional on purpose, since ingestion
+    wants a filing and its chunks to land together, and flipping one of them
+    would leak `autocommit` back into the pool when it was returned.
+    """
+    with Connection.connect(settings.database_url, autocommit=True) as conn:
+        yield conn
+
+
 def init_schema() -> None:
     """Apply sql/schema.sql. Every statement in it is idempotent, so this is
     safe to call on every startup."""

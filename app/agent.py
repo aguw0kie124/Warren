@@ -26,10 +26,16 @@ C4a adds one more, on the same principle: a context-window guard that elides
 the bodies of old tool results on the way into the model, so a long multi-hop
 run stops re-sending every passage it has ever retrieved. See
 `trim_tool_results()`.
+
+C4b makes the loop multi-turn by persisting state to Postgres under a
+`thread_id`, so a follow-up question can resolve *"which of those…"* against
+the conversation that produced it. See `get_checkpointer()` and `answer()`.
 """
 
 import logging
+import threading
 from typing import Annotated, TypedDict
+from uuid import uuid4
 
 import anthropic
 from langchain_anthropic import ChatAnthropic
@@ -40,12 +46,15 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import RetryPolicy
 
 from app.config import settings
+from app.db import autocommit_conn, get_pool
 from app.tools import TOOLS, Citation
 
 logger = logging.getLogger(__name__)
@@ -415,8 +424,69 @@ def tool_node(state: AgentState) -> dict:
     return {"messages": messages, "citations": citations}
 
 
-def build_graph():
-    """Compile the loop. Two nodes and one conditional edge — that is all of it."""
+# C4b · The checkpointer.
+#
+# Over the pool `app/db.py` already owns, not a second one against the same
+# database: two pools would double the connection budget and make "how many
+# connections does this process hold" a question with two answers. PostgresSaver
+# takes a ConnectionPool directly and sets `row_factory` per cursor, so nothing
+# about the pool's existing configuration (pgvector registration included) has
+# to change for it.
+#
+# `setup()` creates and migrates its own tables idempotently. It is called here
+# rather than hand-copied into sql/schema.sql for the same reason the schema
+# file is not hand-written per table: only one of those two rots when the
+# library changes its layout, and it is not this one.
+#
+# It does not run on the pool, though. Its migrations include `CREATE INDEX
+# CONCURRENTLY`, which Postgres rejects inside a transaction block — so the DDL
+# gets one short-lived autocommit connection, and everything after it uses the
+# pool. Making the *pool* autocommit instead, as LangGraph's own examples do,
+# would silently remove transactions from ingestion, which is the one place
+# here that needs them.
+_checkpointer: PostgresSaver | None = None
+
+# `Citation` is the one project type that rides inside checkpointed state — on
+# `ToolMessage.artifact`, where C1 put it. LangGraph's serializer allows
+# unregistered types with a logged warning today and will refuse them in a
+# future release; refused, a citation comes back as `None` rather than as an
+# error, which is the worst available outcome for the one structure whose whole
+# value is that every entry resolves. Naming it here makes that a pinned fact
+# instead of a deprecation notice nobody read.
+CHECKPOINT_SERDE = JsonPlusSerializer(allowed_msgpack_modules=[Citation])
+
+# One lock for both singletons below. Neither construction is thread-safe on
+# its own, and D1 will build the graph from an ASGI startup hook while requests
+# are already arriving; a race here would run `setup()` twice (harmless) or
+# compile two graphs (wasteful). Cheaper to hold a lock for the microsecond
+# than to reason about it later.
+#
+# **Reentrant on purpose**: `get_graph()` holds it and calls `get_checkpointer()`,
+# which takes it again. A plain Lock deadlocks there — silently, with no error
+# and no traceback, which is exactly how it presented the first time.
+_build_lock = threading.RLock()
+
+
+def get_checkpointer() -> PostgresSaver:
+    """The Postgres checkpointer, created and migrated once per process."""
+    global _checkpointer
+    if _checkpointer is None:
+        with _build_lock:
+            if _checkpointer is None:
+                with autocommit_conn() as conn:
+                    PostgresSaver(conn).setup()
+                _checkpointer = PostgresSaver(get_pool(), serde=CHECKPOINT_SERDE)
+                logger.debug("checkpointer ready")
+    return _checkpointer
+
+
+def build_graph(checkpointer=None):
+    """Compile the loop. Two nodes and one conditional edge — that is all of it.
+
+    The checkpointer is a parameter rather than a lookup so that the offline
+    tests can compile the real graph without a database, and so a caller that
+    wants a one-shot run can pass nothing.
+    """
     builder = StateGraph(AgentState)
     # Retry `agent` only. The tools node deliberately converts provider
     # failures into text the model can act on (C1), so retrying it would
@@ -432,7 +502,7 @@ def build_graph():
     builder.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})
     builder.add_edge("tools", "agent")
 
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
 _graph = None
@@ -442,26 +512,73 @@ def get_graph():
     """The compiled graph, built once. app/api.py builds it at startup, not per request."""
     global _graph
     if _graph is None:
-        _graph = build_graph()
+        with _build_lock:
+            if _graph is None:
+                _graph = build_graph(checkpointer=get_checkpointer())
     return _graph
 
 
-def answer(question: str, recursion_limit: int = RECURSION_LIMIT) -> dict:
-    """Run one question to completion.
+def thread_config(thread_id: str, recursion_limit: int = RECURSION_LIMIT) -> dict:
+    """The config every run needs once the graph has a checkpointer.
 
-    Returns `{"answer": str, "citations": list[Citation], "messages": [...]}`.
-    The messages come back too because *which tools were called* is the first
-    thing worth inspecting when an answer looks wrong — often before the answer
-    text itself.
+    In one place because a run without `configurable.thread_id` is not a
+    single-shot run — it is an error from LangGraph, and one that only appears
+    at the call site that forgot it.
     """
+    return {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": recursion_limit,
+    }
+
+
+def answer(
+    question: str,
+    thread_id: str | None = None,
+    recursion_limit: int = RECURSION_LIMIT,
+) -> dict:
+    """Run one question to completion, in a conversation.
+
+    Returns `{"answer", "citations", "messages", "thread_id"}`. The messages
+    come back too because *which tools were called* is the first thing worth
+    inspecting when an answer looks wrong — often before the answer text itself.
+
+    `thread_id` defaults to a fresh uuid, so a caller that has no notion of
+    sessions keeps getting exactly one question's worth of context and needs no
+    changes. Passing the same id again resumes that conversation from Postgres —
+    including across process restarts, which is the whole difference between a
+    checkpointer and a list held in memory.
+
+    **`messages` and `citations` are the whole thread's, not this turn's.** The
+    reducers accumulate, and that is the honest answer for a follow-up: turn 2's
+    answer genuinely rests on the passages turn 1 retrieved, so listing only the
+    sources turn 2 happened to re-fetch would under-credit it. A caller wanting
+    just this turn's messages can slice from the length it saw last time.
+    """
+    thread_id = thread_id or str(uuid4())
     state = get_graph().invoke(
         {"messages": [HumanMessage(question)], "citations": []},
-        config={"recursion_limit": recursion_limit},
+        config=thread_config(thread_id, recursion_limit),
     )
     return {
         "answer": final_text(state["messages"]),
         "citations": state.get("citations", []),
         "messages": state["messages"],
+        "thread_id": thread_id,
+    }
+
+
+def thread_state(thread_id: str) -> dict:
+    """What Postgres holds for one conversation, without running the model.
+
+    The read side of the checkpointer: `{"messages", "citations"}`, empty for a
+    thread that has never run. Used by the gate to prove a fresh process can
+    still see a thread, and by D1 to render a session's history.
+    """
+    snapshot = get_graph().get_state(thread_config(thread_id))
+    values = snapshot.values or {}
+    return {
+        "messages": values.get("messages", []),
+        "citations": values.get("citations", []),
     }
 
 

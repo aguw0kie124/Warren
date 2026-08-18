@@ -498,6 +498,194 @@ def test_the_node_sends_the_trimmed_history_and_returns_only_the_reply(scripted)
     assert "citations" not in result
 
 
+# --- C4b · checkpointer and multi-turn --------------------------------------
+#
+# The saver here is InMemorySaver, not PostgresSaver: what these tests are
+# about is the graph's *use* of a checkpointer — thread isolation, the state a
+# second turn resumes, the config `answer()` builds — and none of that is
+# Postgres-specific. That the Postgres one actually persists across a process
+# boundary is the one claim an offline test cannot make, which is why
+# `check_agent.py --memory` proves it by re-running itself as a subprocess.
+
+
+@pytest.fixture
+def saved_graph():
+    """The real graph, checkpointed in memory."""
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    return agent.build_graph(checkpointer=InMemorySaver())
+
+
+def turn(graph, question: str, thread: str) -> dict:
+    return graph.invoke(
+        {"messages": [HumanMessage(question)], "citations": []},
+        config=agent.thread_config(thread),
+    )
+
+
+def test_a_second_turn_on_one_thread_sees_the_first(scripted, saved_graph, stub_search):
+    model = scripted(
+        AIMessage("", tool_calls=[tool_call("search_filings", {"query": "risks", "ticker": "AAPL"})]),
+        AIMessage("Apple flagged supply chain risk."),
+        AIMessage("The supplier concentration one."),
+    )
+
+    first = turn(saved_graph, "What are Apple's key risk factors?", "t1")
+    second = turn(saved_graph, "Which of those involve suppliers?", "t1")
+
+    # The follow-up's prompt carries turn 1 — question, tool call, passage and
+    # answer — which is the whole point: "those" has no other referent.
+    third_turn = "\n".join(str(m.content) for m in model.calls[2])
+    assert "What are Apple's key risk factors?" in third_turn
+    assert stub_search.content in third_turn
+    assert len(second["messages"]) == len(first["messages"]) + 2
+
+
+def test_a_different_thread_starts_empty(scripted, saved_graph):
+    scripted(AIMessage("first"), AIMessage("second"))
+
+    turn(saved_graph, "What are Apple's key risk factors?", "t1")
+    other = turn(saved_graph, "Which of those involve suppliers?", "t2")
+
+    assert len(other["messages"]) == 2
+    assert "Apple" not in str(other["messages"][0].content)
+
+
+def test_citations_accumulate_over_a_thread(scripted, saved_graph, stub_search):
+    """A follow-up's answer rests on the passages the first turn retrieved, so
+    the thread's sources are the honest list — and the reducer still de-dupes."""
+    scripted(
+        AIMessage("", tool_calls=[tool_call("search_filings", {"query": "risks", "ticker": "AAPL"}, "a")]),
+        AIMessage("Apple flagged supply chain risk."),
+        AIMessage("", tool_calls=[tool_call("search_filings", {"query": "suppliers", "ticker": "AAPL"}, "b")]),
+        AIMessage("The supplier concentration one."),
+    )
+
+    turn(saved_graph, "What are Apple's key risk factors?", "t1")
+    second = turn(saved_graph, "Which of those involve suppliers?", "t1")
+
+    assert len(second["citations"]) == 1
+    assert isinstance(second["citations"][0], Citation)
+
+
+def test_the_context_guard_never_reaches_the_checkpoint(scripted, saved_graph, stub_search):
+    """Trimming is per-turn. A stub that reached state would be checkpointed,
+    turning a saving into permanent data loss."""
+    scripted(AIMessage("done"))
+
+    state = saved_graph.invoke(
+        {"messages": conversation(5), "citations": []},
+        config=agent.thread_config("t1"),
+    )
+
+    assert elided(state["messages"]) == []
+
+
+def test_a_graph_compiles_and_runs_without_a_checkpointer(graph, scripted):
+    """The single-shot path stays intact — and needs no database."""
+    scripted(AIMessage("done"))
+
+    assert graph.checkpointer is None
+    assert agent.final_text(
+        graph.invoke({"messages": [HumanMessage("q")], "citations": []})["messages"]
+    ) == "done"
+
+
+def test_thread_config_carries_both_the_thread_and_the_limit():
+    config = agent.thread_config("abc")
+
+    assert config["configurable"]["thread_id"] == "abc"
+    assert config["recursion_limit"] == agent.RECURSION_LIMIT
+    assert agent.thread_config("abc", recursion_limit=4)["recursion_limit"] == 4
+
+
+class RecordingGraph:
+    """Stands in for the compiled graph, to see what `answer()` sends it."""
+
+    def __init__(self) -> None:
+        self.configs: list[dict] = []
+
+    def invoke(self, state, config):
+        self.configs.append(config)
+        return {"messages": [*state["messages"], AIMessage("ok")], "citations": []}
+
+
+def test_answer_defaults_to_a_fresh_thread_each_call(monkeypatch):
+    """So every caller that predates sessions keeps getting exactly one
+    question's worth of context, with no argument and no leakage between runs."""
+    recorder = RecordingGraph()
+    monkeypatch.setattr(agent, "get_graph", lambda: recorder)
+
+    first = agent.answer("q")
+    second = agent.answer("q")
+
+    threads = [c["configurable"]["thread_id"] for c in recorder.configs]
+    assert threads[0] != threads[1]
+    assert first["thread_id"] == threads[0]
+    assert second["thread_id"] == threads[1]
+
+
+def test_answer_uses_the_thread_id_it_was_given(monkeypatch):
+    recorder = RecordingGraph()
+    monkeypatch.setattr(agent, "get_graph", lambda: recorder)
+
+    result = agent.answer("q", thread_id="session-7", recursion_limit=9)
+
+    assert recorder.configs[0] == {
+        "configurable": {"thread_id": "session-7"},
+        "recursion_limit": 9,
+    }
+    assert result["thread_id"] == "session-7"
+    assert result["answer"] == "ok"
+
+
+def test_a_checkpointed_conversation_round_trips_through_the_serializer():
+    """The serializer is where C4b can lose data quietly.
+
+    LangGraph allows unregistered types with a warning now and will refuse them
+    later — refused, a `Citation` revives as `None` rather than raising, so the
+    citation list shrinks and nothing says why. `CHECKPOINT_SERDE` names the
+    type; this asserts that naming it does not cost the built-in message types,
+    which is the other way to get this wrong.
+    """
+    source = citation()
+    state = {
+        "messages": [
+            HumanMessage("What are Apple's key risk factors?"),
+            AIMessage("", tool_calls=[tool_call("search_filings", {"query": "risks"})]),
+            ToolMessage(content="[1] a passage", tool_call_id="call-1",
+                        name="search_filings", artifact=[source]),
+        ],
+        "citations": [source],
+    }
+
+    revived = agent.CHECKPOINT_SERDE.loads_typed(agent.CHECKPOINT_SERDE.dumps_typed(state))
+
+    assert revived["citations"] == [source]
+    assert isinstance(revived["citations"][0], Citation)
+    assert [type(m) for m in revived["messages"]] == [HumanMessage, AIMessage, ToolMessage]
+
+    # And the part that does *not* survive as an object: a restored
+    # ToolMessage's `artifact` comes back as plain dicts, because LangChain
+    # revives the message and treats that field as data. Harmless, and asserted
+    # so it stays known: artifacts are read once, by `tool_node`, off messages
+    # it has just produced in-process. Nothing reads them back out of a
+    # checkpoint — `state["citations"]` above is what a resumed thread uses.
+    assert revived["messages"][2].artifact == [source.model_dump()]
+
+
+def test_nothing_touches_postgres_until_a_checkpointed_graph_is_asked_for(monkeypatch):
+    """Importing this module, and compiling a graph, must stay offline — that is
+    what lets these tests and app/api.py's import-time wiring work without a
+    database or a key."""
+    def explode():
+        raise AssertionError("the pool was opened")
+
+    monkeypatch.setattr(agent, "get_pool", explode)
+
+    agent.build_graph()  # no checkpointer asked for, so no connection
+
+
 # --- citations --------------------------------------------------------------
 
 

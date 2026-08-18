@@ -3,8 +3,10 @@
     python scripts/check_agent.py                    # the benchmark set
     python scripts/check_agent.py --only 3 4         # just the news/web pair
     python scripts/check_agent.py --guard            # C4a's context guard alone
+    python scripts/check_agent.py --memory           # C4b's checkpointer + multi-turn
     python scripts/check_agent.py --ask "..."        # one ad-hoc question
     python scripts/check_agent.py --quiet            # verdicts only, no answers
+    python scripts/check_agent.py --show-thread ID   # dump a stored thread (free)
 
 **Which tools were called is the primary reading.** With five tools and three
 that plausibly answer "what's going on with Apple", tool choice is the thing
@@ -37,16 +39,28 @@ The retry policy is covered offline in tests/test_agent.py, since making a
 real provider return 529 on demand is not something a gate can arrange.
 
 C4a is `--guard`, a separate mode rather than a seventh benchmark question.
-Its question is deliberately expensive — six k=12 searches, ~150k characters
+Its question is deliberately expensive — eight k=12 searches, ~200k characters
 of filing text — and the benchmark set should stay cheap enough to re-run
 freely. It is also the one check here whose evidence is arithmetic rather than
 judgement: history only ever grows, so a prompt that gets *smaller* between
 turns cannot happen without the guard.
+
+C4b is `--memory`, and it is built around a control rather than a single
+reading. A follow-up naming no company is asked twice — once on the thread that
+answered the first question, once on a fresh one — and the pair is the evidence:
+the same question, the same model, differing only in whether Postgres had
+anything to restore. The third claim, that the conversation outlived the
+process, is checked by re-running this script with `--show-thread`: a genuinely
+new process, reading Postgres, calling no model and costing nothing.
 """
 
 import argparse
+import json
 import logging
 import re
+import subprocess
+import sys
+from uuid import uuid4
 
 from app import agent, finnhub
 from app.config import settings
@@ -107,16 +121,23 @@ BENCHMARK = [
 # below exist to make visible.
 CACHE_MINIMUM_TOKENS = 4096 if "haiku" in settings.anthropic_model else 1024
 
-# C4a · The question the context guard exists for, and it is not subtle: three
-# companies × two fiscal years at the maximum k, which is ~150k characters of
-# filing text against a ~64k budget. The instruction to retrieve 12 passages is
-# in the question on purpose — the guard is what makes a heavy question
-# affordable, so the gate has to ask a heavy one rather than hope for it.
+# C4a · The question the context guard exists for, and it is not subtle: four
+# companies × two topics at the maximum k is eight searches and ~200k
+# characters of filing text against a ~64k budget. The instruction to retrieve
+# 12 passages is in the question on purpose — the guard is what makes a heavy
+# question affordable, so the gate has to ask a heavy one rather than hope for
+# one.
+#
+# **Every part of it is answerable from the corpus as ingested, deliberately.**
+# The first version asked for a year-over-year comparison, which no covered
+# company can support: the corpus holds exactly one 10-K per ticker (the rest
+# are 10-Qs). The model correctly refused to invent the missing year — but a
+# question whose answer is half a refusal makes half the searches vanish, and
+# the guard is only exercised by searches that actually run.
 GUARD_QUESTION = (
-    "Compare the risk factors Apple, Microsoft and Meta each disclosed in "
-    "their two most recent 10-K filings, and say what changed year over year "
-    "for each company. Retrieve 12 passages per search so the comparison is "
-    "thorough."
+    "Compare how Apple, Microsoft, Meta and Tesla each describe competition "
+    "risk and regulatory risk in their most recent 10-K. Retrieve 12 passages "
+    "per search so the comparison is thorough."
 )
 
 # Question 6 only: the answer has to admit the gap rather than paper over it.
@@ -136,16 +157,19 @@ def verdict(ok: bool, label: str) -> bool:
     return ok
 
 
-def run_streaming(question: str) -> dict:
+def run_streaming(question: str, thread_id: str | None = None) -> dict:
     """Run one question, printing each tool call as the graph makes it.
 
     Streaming rather than a plain invoke because the interesting event is the
     tool call, and it happens well before the answer exists.
+
+    A fresh `thread_id` per call unless one is given, so every check above
+    behaves exactly as it did before C4b: one question, no inherited context.
     """
     state: dict = {"messages": [], "citations": []}
     stream = agent.get_graph().stream(
         {"messages": [("user", question)], "citations": []},
-        config={"recursion_limit": agent.RECURSION_LIMIT},
+        config=agent.thread_config(thread_id or str(uuid4())),
         stream_mode="values",
     )
     for state in stream:
@@ -340,14 +364,19 @@ def check_context_guard(state: dict) -> None:
     print(f"  prompt per turn (tokens):  "
           f"{' → '.join(f'{prompt_tokens(row):,}' for row in rows)}")
 
-    if not elided:
-        print("  [-- ] not exercised: the run never crossed the budget, so the guard "
-              "had nothing\n         to do. That is the correct behaviour for a light "
-              "question — but it means\n         this run proves nothing about the "
-              "guard. Ask something heavier.")
+    # A failure, not a note. Eliding nothing is the *correct* behaviour for a
+    # light question — but `--guard` exists to exercise the guard, so a run
+    # that never crossed the budget has established nothing, and must not be
+    # able to report "all checks passed" for having done nothing.
+    if not verdict(
+        bool(elided),
+        f"the run crossed the budget and the guard engaged (elided {elided})",
+    ):
+        print("        ↳ the question was not heavy enough, or fewer searches ran than "
+              "it asks for.\n          Check the tool calls above before suspecting the "
+              "guard: it cannot be\n          observed by a run that gave it nothing to "
+              "do.")
         return
-
-    print(f"  elided {elided} old tool result(s) from the last turn's payload")
 
     peak = max(prompt_tokens(row) for row in rows)
     shrank = [
@@ -373,10 +402,181 @@ def check_context_guard(state: dict) -> None:
     # Citations live outside the messages, which is the whole reason trimming
     # is safe: eliding the passage must not cost the source it came from.
     filings = [c for c in state.get("citations", []) if c.type == "filing"]
-    years = sorted({year for c in filings for year in re.findall(r"\b20\d{2}\b", c.label)})
+    companies = sorted({c.label.split(" 10-")[0] for c in filings})
     verdict(bool(filings), f"filing citations survived the trim ({len(filings)} of them)")
-    print(f"    filing years cited: {', '.join(years) or 'none'} — the answer "
-          "should still compare both")
+    print(f"    companies cited: {', '.join(companies) or 'none'}")
+    print("    ↳ the human reading: does the answer still say something specific about "
+          "the\n      companies whose passages were elided, or only about the recent "
+          "ones?")
+
+
+# C4b · Two turns where the second is meaningless on its own.
+#
+# "Which of those" has no antecedent and names no company, so a run that comes
+# back with Apple's risk factors — by searching AAPL again, or by reasoning
+# over the passages turn 1 already retrieved — can only have read turn 1.
+#
+# **The control is what makes that evidence rather than assumption.** The same
+# follow-up runs on a fresh thread, and must resolve nothing. Without it, a
+# model that simply guesses the most-discussed company would pass; with it, the
+# difference between the two runs is the checkpointer and nothing else.
+#
+# The follow-up is answerable from the same 10-K the first turn retrieved, per
+# the corpus rule: one 10-K per ticker means a follow-up asking about *last
+# year's* risk factors would be refused, and a refusal exercises nothing.
+MEMORY_TURNS = (
+    "What are Apple's key risk factors in its most recent 10-K?",
+    "Which of those involve manufacturing and suppliers outside the United States?",
+)
+
+
+def _thread_summary(thread_id: str) -> dict:
+    """Everything Postgres holds for one thread, reduced to countable facts."""
+    state = agent.thread_state(thread_id)
+    messages = state["messages"]
+    return {
+        "messages": len(messages),
+        "human_turns": sum(1 for m in messages if getattr(m, "type", "") == "human"),
+        "citations": len(state["citations"]),
+        # Reading `.type` off each citation is itself a check: these were
+        # serialized into Postgres as pydantic objects, and a run that got dicts
+        # back would raise here rather than quietly hand D1 the wrong shape.
+        "citation_types": sorted({c.type for c in state["citations"]}),
+        "first_human": next(
+            (agent.final_text([m]) or str(m.content)
+             for m in messages if getattr(m, "type", "") == "human"),
+            "",
+        )[:80],
+    }
+
+
+def check_memory(quiet: bool) -> None:
+    """C4b: does a follow-up resolve against a conversation it never saw?
+
+    Three separate claims, and they fail in different places:
+
+    1. The same thread carries context forward — the follow-up resolves "those".
+    2. A *different* thread does not. Without this, a model that simply guesses
+       Apple would pass check 1 while the checkpointer did nothing.
+    3. A **new process** still sees the thread. This is the one that separates a
+       checkpointer from an in-memory list, and it is checked by re-running this
+       script as a subprocess, which costs nothing: reading state calls no model.
+    """
+    thread_a, thread_b = str(uuid4()), str(uuid4())
+    first, follow_up = MEMORY_TURNS
+
+    rule(f"C4b · thread {thread_a[:8]} · turn 1: {first}")
+    state_one = run_streaming(first, thread_id=thread_a)
+    turn_one_messages = len(state_one["messages"])
+    print_usage(state_one)
+    verdict(
+        "search_filings" in {n for n, _ in agent.tool_calls_made(state_one["messages"])},
+        "turn 1 searched the filings",
+    )
+
+    rule(f"C4b · thread {thread_a[:8]} · turn 2: {follow_up}")
+    state_two = run_streaming(follow_up, thread_id=thread_a)
+    # Compared by message id rather than by equality: turn 2's copies came back
+    # through Postgres, and a serializer that renders one metadata field
+    # differently would fail an equality check while having lost nothing. The
+    # ids are what identify the messages as the same ones.
+    resumed = [m.id for m in state_two["messages"][:turn_one_messages]] == [
+        m.id for m in state_one["messages"]
+    ]
+    verdict(
+        resumed and len(state_two["messages"]) > turn_one_messages,
+        f"turn 2 resumed the stored conversation "
+        f"({turn_one_messages} messages restored, "
+        f"{len(state_two['messages']) - turn_one_messages} added)",
+    )
+
+    # Two ways to resolve "those", and the second is the better one.
+    #
+    # This check originally demanded a fresh `search_filings(ticker="AAPL")`,
+    # on the reasoning that a tool argument is harder to fake than prose. The
+    # first live run failed it — by answering *correctly* with no tool call at
+    # all. Turn 1's passages are still in the conversation and well inside the
+    # context guard's recent rounds, so re-retrieving them would have been
+    # money spent to learn nothing. Reasoning over what it already has is what
+    # a ReAct loop is supposed to do, and requiring the wasteful path would
+    # have made the gate a bug report against good behaviour.
+    #
+    # So either counts. What keeps the prose version honest is the fresh-thread
+    # control below: if naming Apple unprompted were something this model does
+    # anyway, that run would name it too.
+    new_messages = state_two["messages"][turn_one_messages:]
+    searched_aapl = "AAPL" in json.dumps(agent.tool_calls_made(new_messages))
+    answer_two = agent.final_text(state_two["messages"])
+    named_apple = "apple" in answer_two.lower()
+    how = ("re-searched AAPL" if searched_aapl
+           else "answered from turn 1's passages, no new tool call")
+    verdict(
+        searched_aapl or named_apple,
+        f"turn 2 resolved \"those\" to Apple from a question that never names it ({how})",
+    )
+
+    rule(f"C4b · thread {thread_b[:8]} (fresh) · the same follow-up, alone")
+    state_solo = run_streaming(follow_up, thread_id=thread_b)
+    solo_args = json.dumps(agent.tool_calls_made(state_solo["messages"]))
+    # Measured the same way as turn 2, so the two are comparable: did it search
+    # AAPL, and did it come back with filing sources? Not "does the word Apple
+    # appear" — a clarifying question is allowed to offer Apple as an example,
+    # and would still be the right behaviour.
+    solo_filings = [c for c in state_solo.get("citations", []) if c.type == "filing"]
+    verdict(
+        "AAPL" not in solo_args and not solo_filings,
+        "the same follow-up on a fresh thread resolved nothing — no AAPL search, "
+        "no filing sources"
+        + (" (it answered anyway: the model is guessing, so turn 2 proves less "
+           "than it appears to)" if "AAPL" in solo_args or solo_filings else ""),
+    )
+
+    # Check 3. A subprocess is the honest form of "restart the process": same
+    # database, nothing shared in memory, and no model, so it is free.
+    rule("C4b · a new process reads the thread back")
+    probe = subprocess.run(
+        [sys.executable, __file__, "--show-thread", thread_a],
+        capture_output=True, text=True,
+    )
+    if probe.returncode != 0:
+        print(indent(probe.stderr.strip()[-800:] or "(no output)"))
+        verdict(False, "a fresh process read the thread back from Postgres")
+    else:
+        reloaded = json.loads(probe.stdout.strip().splitlines()[-1])
+        print(f"  reloaded: {reloaded['messages']} messages, "
+              f"{reloaded['human_turns']} human turns, "
+              f"{reloaded['citations']} citations {reloaded['citation_types']}")
+        print(f"  first turn as stored: {reloaded['first_human']!r}")
+        verdict(
+            reloaded["messages"] == len(state_two["messages"]),
+            f"a fresh process read back all {len(state_two['messages'])} messages "
+            f"(got {reloaded['messages']})",
+        )
+        verdict(
+            reloaded["first_human"].startswith(first[:40]),
+            "the restored thread opens with turn 1's question",
+        )
+        verdict(
+            reloaded["citations"] > 0 and "filing" in reloaded["citation_types"],
+            "citations survived the round-trip as typed objects",
+        )
+
+    # The guard writes stubs into the invoke payload only. If one had ever
+    # reached state, this is where it would become permanent — a checkpointed
+    # elision is not a per-turn saving, it is data loss.
+    stubbed = [
+        m for m in state_two["messages"]
+        if getattr(m, "type", "") == "tool" and "omitted to conserve context" in str(m.content)
+    ]
+    verdict(not stubbed, "no context-guard stub was persisted to the checkpoint")
+
+    if not quiet:
+        for label, state in (("turn 1", state_one), ("turn 2", state_two),
+                             ("fresh thread", state_solo)):
+            print(f"\n    ── {label} ──\n{indent(agent.final_text(state['messages']))}")
+        print("\n    ↳ the human reading: does turn 2 answer about the risk factors "
+              "turn 1 listed,\n      and does the fresh-thread answer ask what company "
+              "is meant rather than\n      inventing one?")
 
 
 def check_citation_urls(state: dict) -> None:
@@ -421,9 +621,23 @@ def main() -> None:
     ap.add_argument("--only", type=int, nargs="*", help="benchmark numbers to run (1-6)")
     ap.add_argument("--guard", action="store_true",
                     help="run C4a's heavy question and check the context guard")
+    ap.add_argument("--memory", action="store_true",
+                    help="run C4b's two-turn conversation and check the checkpointer")
+    ap.add_argument("--show-thread", metavar="ID",
+                    help="print one stored thread as JSON and exit (no model, no cost)")
     ap.add_argument("--ask", help="run one ad-hoc question instead of the set")
     ap.add_argument("--quiet", action="store_true", help="verdicts only, no answer text")
     args = ap.parse_args()
+
+    # Before configure(), and deliberately: reading a thread back needs Postgres
+    # and no API key at all. That is what lets --memory re-run this script as a
+    # subprocess to prove the conversation outlived the process that wrote it.
+    if args.show_thread:
+        try:
+            print(json.dumps(_thread_summary(args.show_thread)))
+        finally:
+            close_pool()
+        return
 
     configure()
 
@@ -442,6 +656,9 @@ def main() -> None:
             check_citation_urls(state)
             if not args.quiet:
                 print(f"\n{indent(answer)}")
+
+        elif args.memory:
+            check_memory(args.quiet)
 
         elif args.ask:
             rule(args.ask)
