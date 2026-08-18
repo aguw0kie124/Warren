@@ -25,14 +25,17 @@ dependencies = [
     # Finnhub needs no SDK — it is plain REST over the httpx client above.
     "tavily-python>=0.5",           # web search returning extracted text, not HTML
 
-    # --- Module C1: the tool layer ---
-    # @tool and ToolMessage only. langgraph and langchain-anthropic arrive with
-    # C2, when there is actually a graph and a model to run.
+    # --- Module C: tools + agent ---
+    # langchain-core carries @tool and ToolMessage (C1); the other two are the
+    # graph and the model (C2). langgraph brings its own prebuilt ToolNode and
+    # tools_condition, which is why the loop is ~40 lines.
     "langchain-core>=0.3",
+    "langgraph>=0.2",
+    "langchain-anthropic>=0.3",
 ]
 
-# Remaining C/D deps (langgraph, langchain-anthropic, fastapi) get added when
-# those modules are actually built — not carried as dead weight before then.
+# Module D's dep (fastapi) gets added when that module is actually built — not
+# carried as dead weight before then.
 
 [project.optional-dependencies]
 dev = [

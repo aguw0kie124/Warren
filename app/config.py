@@ -43,6 +43,22 @@ class Settings(BaseSettings):
     finnhub_api_key: str = ""
     tavily_api_key: str = ""
 
+    # --- agent (Module C) ---
+    # The only paid, per-request model in the system. Not needed for Modules A
+    # or B, or for C1's tool layer — there is no LLM in any of those.
+    anthropic_api_key: str = ""
+    # Pinned to the dated snapshot, not the `claude-haiku-4-5` alias that
+    # resolves to it today. C2's gate exists to settle behaviour that belongs
+    # to the model — tool routing across five overlapping docstrings,
+    # corpus-gap honesty, whether `[n]` markers appear at all — and an alias
+    # that moves would retire those findings silently, with nothing in the
+    # repo changing to show it.
+    anthropic_model: str = "claude-haiku-4-5-20251001"
+    # LangChain's own default is small enough to truncate a sourced answer
+    # mid-sentence, and a truncated answer looks like a bad answer rather than
+    # a clipped one. Set it explicitly.
+    llm_max_tokens: int = 8192
+
     # --- paths ---
     raw_dir: Path = PROJECT_ROOT / "data" / "raw"
     cache_dir: Path = PROJECT_ROOT / "data" / "cache"
