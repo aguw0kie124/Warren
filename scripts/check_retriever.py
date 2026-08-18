@@ -16,7 +16,7 @@ import logging
 
 from app.config import settings
 from app.db import close_pool
-from app.retriever import search
+from app.retriever import hybrid_search, search
 from app.sec_http import close_client, sec_get
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
@@ -29,12 +29,29 @@ SNAPSHOT = settings.cache_dir.parent / "retrieval_a7.json"
 QUESTIONS = [
     ("semantic", "What are Apple's main business risks?", {"ticker": "AAPL"}),
     ("semantic", "How is the company growing revenue?", {"ticker": "MSFT"}),
-    ("semantic", "Is the companies value driven by elon?", {"ticker": "TSLA"}),
+    ("semantic", "What could disrupt manufacturing and supply?", {"ticker": "TSLA"}),
     ("semantic", "Risks from artificial intelligence investment", {"ticker": "META"}),
-    ("exact", "material weakness in internal control", {}),
-    ("exact", "going concern", {}),
-    ("exact", "Item 7A quantitative and qualitative disclosures", {}),
     ("exact", "effective tax rate", {"ticker": "AAPL"}),
+    ("exact", "goodwill impairment", {}),
+    ("exact", "remaining performance obligation", {"ticker": "MSFT"}),
+    ("exact", "Reality Labs segment results", {"ticker": "META"}),
+]
+
+# (query, the literal string a correct hit must contain, filters).
+#
+# Every phrase here was confirmed present in the corpus first. An earlier
+# version of this set used "material weakness" and "going concern", which
+# appear in ZERO chunks — these are four large, healthy filers who report
+# neither. Those queries could not distinguish a good retriever from a bad
+# one, because there was no right answer to find.
+EXACT_TERMS = [
+    ("effective tax rate", "effective tax rate", {"ticker": "AAPL"}),
+    ("goodwill impairment", "goodwill impairment", {}),
+    ("remaining performance obligation", "remaining performance obligation", {"ticker": "MSFT"}),
+    ("What is Reality Labs?", "Reality Labs", {"ticker": "META"}),
+    ("Who is the Technoking?", "Technoking", {"ticker": "TSLA"}),
+    ("Full Self-Driving capability", "Full Self-Driving", {"ticker": "TSLA"}),
+    ("Is the company dependent on Elon Musk?", "Elon Musk", {"ticker": "TSLA"}),
 ]
 
 
@@ -63,6 +80,53 @@ def run(label: str, query: str, k: int, **filters) -> list[dict]:
     ]
 
 
+def first_hit(results, phrase: str) -> int | None:
+    """1-based rank of the first result literally containing the phrase."""
+    for i, r in enumerate(results, start=1):
+        if phrase.lower() in r.content.lower():
+            return i
+    return None
+
+
+def compare(k: int) -> None:
+    """Dense vs hybrid on the queries hybrid is supposed to win.
+
+    Measured, not eyeballed: the score is the rank at which the first chunk
+    literally containing the phrase appears. Lower is better; a dash means it
+    never appeared in the top k at all.
+    """
+    print(f"\n=== dense vs hybrid: rank of first literal match (k={k}) ===")
+    print(f"  {'query':<38} {'phrase':<26} {'dense':>6} {'hybrid':>7}  verdict")
+
+    wins = losses = 0
+    for query, phrase, filters in EXACT_TERMS:
+        d = first_hit(search(query, k=k, **filters), phrase)
+        h = first_hit(hybrid_search(query, k=k, **filters), phrase)
+
+        if (h or 99) < (d or 99):
+            verdict, _ = "hybrid better", (wins := wins + 1)
+        elif (h or 99) > (d or 99):
+            verdict, _ = "DENSE better", (losses := losses + 1)
+        else:
+            verdict = "tie"
+
+        print(f"  {query[:37]:<38} {phrase[:25]:<26} "
+              f"{(d or '-'):>6} {(h or '-'):>7}  {verdict}")
+
+    print(f"\n  hybrid wins {wins}, loses {losses}, of {len(EXACT_TERMS)}")
+
+
+def show_fusion(query: str, k: int, **filters) -> None:
+    """Where each ranker placed the fused results — the diagnostic view."""
+    print(f"\n=== fusion detail: {query!r} ===")
+    for i, r in enumerate(hybrid_search(query, k=k, **filters), start=1):
+        found = "both" if r.dense_rank and r.sparse_rank else (
+            "dense only" if r.dense_rank else "sparse only")
+        print(f"  {i}. score={r.score:.5f}  dense={r.dense_rank or '-':>3} "
+              f"sparse={r.sparse_rank or '-':>3}  ({found})")
+        print(f"     {r.ticker} {r.section}: {r.content[:120].replace(chr(10), ' ')}")
+
+
 def check_url(url: str) -> bool:
     """Fetch the citation URL through the project's own SEC client.
 
@@ -85,17 +149,28 @@ def main() -> None:
     ap.add_argument("--form-type")
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--save", action="store_true", help="write the A8 comparison snapshot")
+    ap.add_argument("--compare", action="store_true", help="A8: dense vs hybrid")
+    ap.add_argument("--hybrid", action="store_true", help="use hybrid for --query")
     args = ap.parse_args()
 
     snapshot: list[dict] = []
     try:
+        if args.compare:
+            compare(args.k)
+            show_fusion("Is the company dependent on Elon Musk?", 3, ticker="TSLA")
+            show_fusion("goodwill impairment", 3)
+            return
+
         if args.query:
             filters = {
                 k: v for k, v in
                 {"ticker": args.ticker, "section": args.section, "form_type": args.form_type}.items()
                 if v
             }
-            run("adhoc", args.query, args.k, **filters)
+            engine = hybrid_search if args.hybrid else search
+            for r in engine(args.query, k=args.k, **filters):
+                print(f"  {r.score:.5f}  {r.ticker} {r.form_type} {r.section}")
+                print(f"         {r.content[:180].replace(chr(10), ' ')}")
             return
 
         for label, query, filters in QUESTIONS:

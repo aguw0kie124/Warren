@@ -8,7 +8,7 @@ mapping. A8 adds the RRF fusion maths here.
 
 from datetime import date
 
-from app.retriever import Result, _filters, _to_results, _where
+from app.retriever import Result, _filters, _to_results, _where, rrf_score
 
 ROW = (
     "0000320193-25-000079", 3, "Item 1A Risk Factors", "Our business is subject to risk.",
@@ -91,3 +91,51 @@ def test_result_is_immutable():
 def test_result_dataclass_exposes_every_citation_field():
     fields = set(Result.__dataclass_fields__)
     assert {"company_name", "form_type", "section", "filing_date", "source_url"} <= fields
+
+
+# --- A8: RRF fusion maths ---
+
+
+def test_rrf_uses_rank_not_score():
+    # The entire point: cosine similarity and ts_rank_cd are on incomparable
+    # scales, so only position may influence the fused score.
+    assert rrf_score(1, None) == 1 / 61
+    assert rrf_score(None, 1) == 1 / 61
+
+
+def test_rrf_is_symmetric_across_the_two_rankers():
+    # Neither ranker is privileged, so swapping the ranks must not change the
+    # score — which is also why exact ties are common and expected.
+    assert rrf_score(1, 2) == rrf_score(2, 1)
+
+
+def test_agreement_beats_a_single_strong_opinion():
+    # A chunk both rankers place 2nd outranks one that only dense puts 1st.
+    # That is the behaviour hybrid search is bought for.
+    assert rrf_score(2, 2) > rrf_score(1, None)
+
+
+def test_a_chunk_found_by_only_one_ranker_still_scores():
+    # FULL OUTER JOIN semantics: exact-phrase hits dense misses entirely must
+    # still be able to place.
+    assert rrf_score(None, 3) > 0
+
+
+def test_missing_from_both_rankers_scores_zero():
+    assert rrf_score(None, None) == 0.0
+
+
+def test_score_decreases_monotonically_with_rank():
+    scores = [rrf_score(r, None) for r in range(1, 10)]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_damping_constant_compresses_top_ranks():
+    # k=60 is large relative to the ranks that matter, so rank 1 and rank 2
+    # differ by little — no single ranker's top hit can dominate the fusion.
+    gap = rrf_score(1, None) - rrf_score(2, None)
+    assert gap < 0.1 * rrf_score(1, None)
+
+
+def test_rrf_constant_is_configurable():
+    assert rrf_score(1, None, k=0) == 1.0

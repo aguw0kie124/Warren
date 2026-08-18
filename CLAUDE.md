@@ -16,16 +16,16 @@ Work proceeds module by module, and **each step stops for human verification bef
 
 | Module | Steps | Status |
 |---|---|---|
-| **A** — data pipeline (EDGAR → Postgres, retrieval) | A0–A8 | A0–A4 done; **A5 next** |
+| **A** — data pipeline (EDGAR → Postgres, retrieval) | A0–A8 | **complete** (A0–A8) |
 | **B** — live data (Finnhub, Tavily) | B1–B2 | not started |
 | **C** — LangGraph agent | C1–C2 | not started |
 | **D** — FastAPI service | D1 | not started |
 
 Module A step map: A0 schema · A1 `tickers.py` · A2/A3 `edgar.py` (+ `sec_http.py`) · A4 `parser.py` · A5 `chunker.py` · A6 `embeddings.py`+`store.py`+`scripts/ingest.py` · A7 dense retrieval · A8 hybrid retrieval.
 
-Each step has a `scripts/check_*.py` gate: `check_db`, `check_tickers`, `check_edgar`, `check_parser`.
+Each step has a `scripts/check_*.py` gate: `check_db`, `check_tickers`, `check_edgar`, `check_parser`, `check_chunker`, `check_retriever`.
 
-**Outstanding before A6:** the schema still declares `vector(384)` from the original bge-small choice. Both tables are empty, so `DROP TABLE IF EXISTS chunks, filings CASCADE;` then re-run `init_schema()` — free now, a migration plus full re-embed later.
+Module B is next, but the plan defers it deliberately — verify Module A end to end first.
 
 Dependencies for unstarted modules are deliberately **not** in `pyproject.toml` — add them when the module is built, not before.
 
