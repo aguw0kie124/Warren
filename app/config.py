@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     chunk_tokens: int = 512
     chunk_overlap_tokens: int = 64
 
+    # --- live data (Module B) ---
+    # Free tiers are sufficient for both. Neither is needed for Module A, so
+    # both default to empty and fail with a pointed message at first use rather
+    # than at import.
+    finnhub_api_key: str = ""
+    tavily_api_key: str = ""
+
     # --- paths ---
     raw_dir: Path = PROJECT_ROOT / "data" / "raw"
     cache_dir: Path = PROJECT_ROOT / "data" / "cache"

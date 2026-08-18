@@ -20,10 +20,14 @@ dependencies = [
     # 5.0 is a hard floor, not caution: embeddinggemma-300m's architecture is
     # unrecognized by earlier releases and fails at load, not at install.
     "sentence-transformers>=5.0",   # local embeddings (embeddinggemma-300m)
+
+    # --- Module B: live data ---
+    # Finnhub needs no SDK — it is plain REST over the httpx client above.
+    "tavily-python>=0.5",           # web search returning extracted text, not HTML
 ]
 
-# Modules B/C/D deps (langgraph, langchain-anthropic, fastapi, tavily) get added
-# when those modules are actually built — not carried as dead weight through Module A.
+# Modules C/D deps (langgraph, langchain-anthropic, fastapi) get added when
+# those modules are actually built — not carried as dead weight before then.
 
 [project.optional-dependencies]
 dev = [
