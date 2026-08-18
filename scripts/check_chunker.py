@@ -1,12 +1,14 @@
 """A5 verification: chunk cached filings and eyeball chunks + metadata.
 
-    python scripts/check_chunker.py                  # every ticker in data/raw/
+    python scripts/check_chunker.py                        # every ticker in data/raw/
     python scripts/check_chunker.py --ticker AAPL --show 3
+    python scripts/check_chunker.py --ticker META --fetch 2   # new ticker, downloads
 
 Filing HTML comes from the data/raw/ cache, but filing *metadata* is pulled
 fresh from EDGAR's submissions API so source_url is the real citation URL
 rather than something reconstructed from a filename. That's one small JSON
-request per ticker; no filing is re-downloaded.
+request per ticker; cached filings are never re-downloaded, and uncached ones
+are skipped entirely unless --fetch asks for them.
 """
 
 import argparse
@@ -42,6 +44,13 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ticker", action="append", help="repeatable; default = all cached")
     ap.add_argument("--show", type=int, default=1, help="full chunks to print per filing")
+    ap.add_argument(
+        "--fetch",
+        type=int,
+        default=0,
+        metavar="N",
+        help="download up to N uncached filings per ticker (default 0 = offline)",
+    )
     args = ap.parse_args()
 
     tickers = args.ticker or cached_tickers()
@@ -50,14 +59,22 @@ def main() -> None:
         return
 
     problems = 0
+    processed = 0
     try:
         for ticker in tickers:
             company = resolve_ticker(ticker)
             filings = list_filings(company, form_types=("10-K", "10-Q"), years=None, limit=20)
-            # Only the ones we already have on disk — this script never downloads.
-            filings = [f for f in filings if local_path(f).exists()]
+
+            cached = [f for f in filings if local_path(f).exists()]
+            # Without --fetch this stays offline, so a ticker with nothing on
+            # disk yields nothing to check — which is reported, never passed.
+            missing = [f for f in filings if not local_path(f).exists()][: args.fetch]
+            if not cached and not missing:
+                print(f"\n{ticker}: no cached filings. Re-run with --fetch 2 to download some.")
+            filings = cached + missing
 
             for filing in filings:
+                processed += 1
                 print(f"\n=== {filing.ticker} {filing.form_type} FY{filing.fiscal_year} "
                       f"({filing.accession_number}) ===")
 
@@ -108,7 +125,11 @@ def main() -> None:
     finally:
         close_client()
 
-    print("\nA5:", "PASS" if problems == 0 else f"FAIL ({problems} problem(s))")
+    if not processed:
+        print("\nA5: NO DATA — nothing was checked, which is not a pass.")
+    else:
+        verdict = "PASS" if problems == 0 else f"FAIL ({problems} problem(s))"
+        print(f"\nA5: {verdict} ({processed} filing(s) checked)")
 
 
 if __name__ == "__main__":

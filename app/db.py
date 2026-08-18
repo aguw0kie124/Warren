@@ -4,7 +4,8 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from psycopg import Connection
+from pgvector.psycopg import register_vector
+from psycopg import Connection, ProgrammingError
 from psycopg_pool import ConnectionPool
 
 from app.config import PROJECT_ROOT, settings
@@ -16,6 +17,25 @@ SCHEMA_PATH = PROJECT_ROOT / "sql" / "schema.sql"
 _pool: ConnectionPool | None = None
 
 
+def _configure(conn: Connection) -> None:
+    """Teach this connection the pgvector types.
+
+    Per-connection, not per-process: the adapter is registered against a
+    connection's type map, so a pooled connection that skipped this would send
+    embeddings as plain text and fail on insert.
+
+    Tolerated failure is the bootstrap case: on a brand-new database the vector
+    type does not exist until init_schema() creates it, and init_schema needs a
+    connection to do that. Refusing to connect here would make a fresh database
+    impossible to initialize.
+    """
+    try:
+        register_vector(conn)
+    except ProgrammingError:
+        conn.rollback()
+        logger.debug("vector type not registered yet; init_schema() will create it")
+
+
 def get_pool() -> ConnectionPool:
     """Return the process-wide connection pool, opening it on first use."""
     global _pool
@@ -25,6 +45,7 @@ def get_pool() -> ConnectionPool:
             min_size=1,
             max_size=8,
             open=True,
+            configure=_configure,
             # Fail fast with a clear error instead of hanging when the container
             # isn't up yet — the most common local failure by far.
             timeout=10.0,
