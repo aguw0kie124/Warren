@@ -94,11 +94,18 @@ class QueryResponse(BaseModel):
     It is already a pydantic model with exactly the three fields this response
     promises, and it is the most important contract in the project — a second
     definition of it here would be free to drift from the one the tools build.
+
+    `route` is E1's dispatch decision, and it is reported because the client
+    cannot otherwise tell the two empty-citation cases apart: `simple` and
+    `advisory` answered without evidence on purpose, while a `research` answer
+    with no citations found nothing. A UI renders those differently, and the
+    difference is exactly the one this system exists to keep visible.
     """
 
     answer: str
     citations: list[Citation]
     thread_id: str
+    route: str
 
 
 class ThreadMessage(BaseModel):

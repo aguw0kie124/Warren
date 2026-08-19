@@ -7,8 +7,8 @@ the quiet kind.
 
 Three of them are worth naming, because none would show up as an error:
 
-- **`messages` leaking into the response body.** `answer()` returns four keys
-  and the contract promises three. The fourth is a list of LangChain objects,
+- **`messages` leaking into the response body.** `answer()` returns five keys
+  and the contract promises four. The fourth is a list of LangChain objects,
   frequently enormous and not JSON-serialisable as it stands; only
   `response_model` keeps it out. Drop that and the first thing that happens is
   a 500 on every query — but reorder it into a `dict` return without the model
@@ -62,6 +62,7 @@ class FakeRuntime:
             "citations": [citation()],
             "messages": [HumanMessage("q"), AIMessage("a")],
             "thread_id": "thread-from-runtime",
+            "route": "research",
         }
         self._state = state if state is not None else {"messages": [], "citations": []}
         self.llm_error = llm_error
@@ -116,13 +117,13 @@ def healthy(monkeypatch):
 # --- the contract -----------------------------------------------------------
 
 
-def test_query_returns_exactly_the_three_promised_fields(client, runtime):
+def test_query_returns_exactly_the_four_promised_fields(client, runtime):
     """And in particular *not* `messages`, which `answer()` also returns."""
     response = client.post("/query", json={"question": "What are Apple's risks?"})
 
     assert response.status_code == 200
     body = response.json()
-    assert set(body) == {"answer", "citations", "thread_id"}
+    assert set(body) == {"answer", "citations", "thread_id", "route"}
     assert body["citations"] == [
         {"type": "filing", "label": "AAPL FY2025 10-K · Item 1A",
          "source_url": "https://sec.gov/x.htm"}

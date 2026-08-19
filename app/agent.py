@@ -55,6 +55,7 @@ from langgraph.types import RetryPolicy
 
 from app.config import settings
 from app.db import autocommit_conn, get_pool
+from app.router import RESPOND_PROMPTS, classify
 from app.tools import TOOLS, Citation
 
 logger = logging.getLogger(__name__)
@@ -96,13 +97,7 @@ Call tools in parallel when the question has independent parts, and call the sam
 
 What this system cannot do:
 
-- **It answers questions about companies you name. It cannot screen, rank, or scan a universe** — there is no tool that takes a criterion ("cheap", "strong margins", "undervalued") and returns a list of companies matching it. Every tool takes a ticker.
-- **It does not recommend what to buy, sell, or hold**, and does not rank companies as investments.
 - **There is no price history**: nothing can answer "how has the stock moved since the 10-K". Say that plainly if asked.
-
-So for "what are some good tech stocks", "what should I buy", "find me undervalued names" and anything else that asks for a list you were not given: **say plainly that you cannot produce it, say why, and offer the version that is answerable** — name a company and its filings, news, market data and metrics can be researched. You may say what generally distinguishes a strong company in a sector (revenue growth, margin trend, leverage) since that is definitional rather than a claim about anyone.
-
-**Do not name example companies in that redirect.** A refusal that then lists candidates has done the thing it just declined to do, and in this system every answer carries citations, so a name offered in passing reads as a sourced recommendation. Naming a company is the user's move, not yours.
 
 Write for someone who reads financial documents. Be specific and quantitative where the sources are, brief where they are not, and never pad an answer to look thorough."""
 
@@ -384,10 +379,22 @@ def merge_citations(
 
 
 class AgentState(TypedDict):
-    """Two fields. Anything more is state the graph doesn't need."""
+    """Three fields, and the third was argued for.
+
+    `messages` and `citations` accumulate through reducers. `route` does not —
+    it is one turn's dispatch decision, last write wins, and E1 rewrites it on
+    every turn precisely so a value cannot survive in the checkpoint from an
+    earlier one and silently steer a later turn.
+
+    The standing rule here was two fields, anything more being state the graph
+    doesn't need. This one it does need: the conditional edge out of `router`
+    reads it, and `POST /query` reports it so a client can tell a sourced
+    answer from a hedged one.
+    """
 
     messages: Annotated[list[AnyMessage], add_messages]
     citations: Annotated[list[Citation], merge_citations]
+    route: str
 
 
 _llm = None
@@ -406,6 +413,24 @@ def get_llm():
         # capability never touches this file.
         _llm = _build_model().bind_tools(TOOLS)
     return _llm
+
+
+_respond_llm = None
+
+
+def get_respond_llm():
+    """The model for the terminal routes, built once per process.
+
+    **Deliberately not tool-bound.** `simple`, `advisory` and `clarify` all
+    answer without evidence — that is what makes them cheap — and binding the
+    five research schemas here would re-add the ~2.4k-token prefix this path
+    exists to skip, while also giving a model that is supposed to decline a
+    row of tools to reach for.
+    """
+    global _respond_llm
+    if _respond_llm is None:
+        _respond_llm = _build_model()
+    return _respond_llm
 
 
 def _require_key(value: str, name: str) -> str:
@@ -457,6 +482,56 @@ def agent_node(state: AgentState) -> dict:
         len(getattr(response, "tool_calls", []) or []),
         _usage_line(response) or "no usage reported",
     )
+    return {"messages": [response]}
+
+
+def router_node(state: AgentState) -> dict:
+    """Classify the question, or decline to — and always write `route`.
+
+    **A turn arriving on a thread with history skips classification entirely.**
+    Read standalone, "which of those involve suppliers outside the US" is
+    textbook `clarify`; routing it there would send C4b's whole multi-turn
+    capability into a clarification prompt. Continuations go to the loop, which
+    is both the correct answer and the safe direction to be wrong in. It also
+    means a follow-up pays no classifier call at all.
+
+    `route` is written on every path, never left to a `.get()` default. The
+    checkpoint holds the previous turn's value, and a node that returned
+    nothing here would let it stand.
+    """
+    if len(state["messages"]) > 1:
+        return {"route": "research"}
+
+    routing = classify(state["messages"][-1].content)
+    logger.debug("router: %s (%s)", routing.route, routing.usage or "no usage reported")
+    return {"route": routing.route}
+
+
+def route_condition(state: AgentState) -> str:
+    """Which node runs. Anything that is not research terminates."""
+    return "agent" if state.get("route") == "research" else "respond"
+
+
+def respond_node(state: AgentState) -> dict:
+    """One model call, a small prompt, no tools, then END.
+
+    The three terminal routes are mechanically identical and differ only in
+    which prompt fragment they get — which is why they share a node rather than
+    getting one each. Adding a fourth terminal class means adding a prompt to
+    `RESPOND_PROMPTS`, not a node.
+
+    An unrecognised route falls to the clarify prompt rather than answering:
+    asking what was meant is the one response that is never wrong to give.
+    """
+    prompt = RESPOND_PROMPTS.get(state.get("route", ""), RESPOND_PROMPTS["clarify"])
+    response = get_respond_llm().invoke([SystemMessage(prompt), *state["messages"]])
+    logger.debug(
+        "respond turn (%s): %s",
+        state.get("route"),
+        _usage_line(response) or "no usage reported",
+    )
+    # No citations key: this path calls no tool, so it has no sources, and an
+    # empty list here is the honest signal a UI renders as "unsourced".
     return {"messages": [response]}
 
 
@@ -543,12 +618,18 @@ def get_checkpointer() -> PostgresSaver:
     return _checkpointer
 
 
-def build_graph(checkpointer=None):
-    """Compile the loop. Two nodes and one conditional edge — that is all of it.
+def build_graph(checkpointer=None, router: bool = True):
+    """Compile the graph. Three nodes, two conditional edges.
 
     The checkpointer is a parameter rather than a lookup so that the offline
     tests can compile the real graph without a database, and so a caller that
     wants a one-shot run can pass nothing.
+
+    `router=False` compiles the pre-E1 shape — START straight into the loop.
+    It exists so E1's gate can run one question set through both shapes and
+    print the real token and dollar delta, which is the only evidence that the
+    router pays for itself; the offline tests use it to exercise the loop
+    without scripting a classification first.
     """
     builder = StateGraph(AgentState)
     # Retry `agent` only. The tools node deliberately converts provider
@@ -558,7 +639,20 @@ def build_graph(checkpointer=None):
     builder.add_node("agent", agent_node, retry_policy=RETRY_POLICY)
     builder.add_node("tools", tool_node)
 
-    builder.add_edge(START, "agent")
+    if router:
+        # E1 · Pre-dispatch. This picks which prompt and tool set run at all;
+        # `tools_condition` below still does the routing *within* a research
+        # question. Two different jobs, which is why both exist.
+        builder.add_node("router", router_node, retry_policy=RETRY_POLICY)
+        builder.add_node("respond", respond_node, retry_policy=RETRY_POLICY)
+        builder.add_edge(START, "router")
+        builder.add_conditional_edges(
+            "router", route_condition, {"agent": "agent", "respond": "respond"}
+        )
+        builder.add_edge("respond", END)
+    else:
+        builder.add_edge(START, "agent")
+
     # tools_condition routes to "tools" when the last message carries tool
     # calls, and to END when it doesn't — that tool-call-free turn is the
     # synthesis, which is why there is no separate synthesis node.
@@ -601,9 +695,12 @@ def answer(
 ) -> dict:
     """Run one question to completion, in a conversation.
 
-    Returns `{"answer", "citations", "messages", "thread_id"}`. The messages
-    come back too because *which tools were called* is the first thing worth
-    inspecting when an answer looks wrong — often before the answer text itself.
+    Returns `{"answer", "citations", "messages", "thread_id", "route"}`. The
+    messages come back too because *which tools were called* is the first thing
+    worth inspecting when an answer looks wrong — often before the answer text
+    itself. `route` is E1's dispatch decision, and it is what tells a caller
+    that an empty citation list means "answered without evidence" rather than
+    "retrieved nothing".
 
     `thread_id` defaults to a fresh uuid, so a caller that has no notion of
     sessions keeps getting exactly one question's worth of context and needs no
@@ -619,7 +716,7 @@ def answer(
     """
     thread_id = thread_id or str(uuid4())
     state = get_graph().invoke(
-        {"messages": [HumanMessage(question)], "citations": []},
+        {"messages": [HumanMessage(question)], "citations": [], "route": ""},
         config=thread_config(thread_id, recursion_limit),
     )
     return {
@@ -627,6 +724,9 @@ def answer(
         "citations": state.get("citations", []),
         "messages": state["messages"],
         "thread_id": thread_id,
+        # Defaulted, not asserted: a graph compiled with `router=False` never
+        # writes it, and that shape is a supported one.
+        "route": state.get("route") or "research",
     }
 
 

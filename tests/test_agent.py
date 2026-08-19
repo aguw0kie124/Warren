@@ -72,7 +72,14 @@ def scripted(monkeypatch):
 
 @pytest.fixture
 def graph():
-    return agent.build_graph()
+    """The ReAct loop alone — START straight into `agent`.
+
+    `router=False` on purpose. Everything in this file is about the loop, and
+    routing through E1 first would mean scripting a classification before every
+    tool call, which tests the router in the file that does not own it. The
+    router's own wiring is tests/test_router.py.
+    """
+    return agent.build_graph(router=False)
 
 
 @pytest.fixture
@@ -87,7 +94,7 @@ def fast_retry_graph(monkeypatch):
         "RETRY_POLICY",
         agent.RETRY_POLICY._replace(initial_interval=0.01, jitter=False),
     )
-    return agent.build_graph()
+    return agent.build_graph(router=False)
 
 
 @pytest.fixture
@@ -778,12 +785,18 @@ def test_the_prompt_separates_recognising_a_company_from_asserting_about_it():
     assert "never from memory" in prompt  # still forbidden, for facts
 
 
-def test_the_prompt_states_the_screening_boundary():
-    """Scope clause and redirect, the pair question 7 reads."""
+def test_the_research_prompt_no_longer_carries_the_screening_boundary():
+    """E1 moved it to `router.ADVISORY_PROMPT`, and that is the point.
+
+    A question asking for a pick never reaches this prompt now, so carrying
+    the refusal here would be dead text riding on every expensive research
+    turn. The clauses themselves are asserted in tests/test_router.py — this
+    checks only that they left, so the two tests cannot both pass on a copy
+    that was duplicated rather than moved.
+    """
     prompt = agent.SYSTEM_PROMPT
-    assert "cannot screen, rank, or scan a universe" in prompt
-    assert "does not recommend what to buy, sell, or hold" in prompt
-    assert "Do not name example companies" in prompt
+    assert "cannot screen, rank, or scan a universe" not in prompt
+    assert "Do not name example companies" not in prompt
 
 
 def test_the_prompt_enumerates_no_tickers():
@@ -884,10 +897,17 @@ def test_merge_citations_handles_empty_state():
 # --- the graph shape --------------------------------------------------------
 
 
-def test_the_graph_is_two_nodes(graph):
+def test_the_loop_is_two_nodes(graph):
+    """The loop itself never grew. E1 wrapped it; it did not rewrite it."""
     nodes = set(graph.get_graph().nodes) - {"__start__", "__end__"}
     assert nodes == {"agent", "tools"}
 
 
-def test_state_has_exactly_messages_and_citations():
-    assert set(AgentState.__annotations__) == {"messages", "citations"}
+def test_state_is_messages_citations_and_route():
+    """Three fields, and the third was argued for — see AgentState's docstring.
+
+    Pinned because the rule it replaced ("two fields, anything more is state
+    the graph doesn't need") was load-bearing, and a fourth should have to
+    argue for itself the same way.
+    """
+    assert set(AgentState.__annotations__) == {"messages", "citations", "route"}

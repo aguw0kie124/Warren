@@ -7,7 +7,6 @@ build/
 dist/
 
 .env
-CLAUDE.md
 
 # Downloaded filing HTML + cached EDGAR metadata — re-fetchable, don't commit.
 data/raw/
