@@ -65,38 +65,13 @@ logger = logging.getLogger(__name__)
 # spending money quietly.
 RECURSION_LIMIT = 25
 
-# C5 · Scope, refusal, and the one thing the model may use its own memory for.
-#
-# Three clauses, and the first is a correction rather than an addition. The
-# original opening forbade answering "from memory" without qualification —
-# which, read literally, forbids knowing that Palantir trades as PLTR, and so
-# refuses ticker-less questions for entirely the wrong reason. C5 as planned
-# solved that with a `lookup_company` tool; that tool is **cut**, on the
-# grounds that `company_tickers.json` is a registry and not a semantic index
-# (it resolves "Apple", never "the iPhone maker"), so the model was always
-# going to be the thing that recognised the company. What a sixth tool would
-# have added is routing risk against C2's 20/20 gate and a turn on questions
-# that already work. An invented ticker already dies in the tool layer:
-# `UnknownSymbolError` from Finnhub, a corpus gap from `search_filings`.
-#
-# So the carve-out is the load-bearing part: **recognise an entity, assert
-# nothing about it.** The tool that receives the ticker is the verifier.
-#
-# The other two clauses exist for the failure this system is shaped to
-# produce: "what are some good tech stocks" has no ticker in it, no tool takes
-# a criterion, and the path of least resistance is `web_search` returning a
-# listicle — which arrives wearing resolving citations and reads as audited.
-# The refusal names the boundary and offers the answerable question.
-#
-# **It must not name example companies while doing so**, which is why that is
-# said twice here. A refusal that lists candidates has performed the
-# recommendation it declined, with the house style making it look sourced.
-#
-# Coverage is deliberately *not* enumerated in this prompt. Injecting
-# `_covered_tickers()` would put a Postgres read inside `_system_message()`,
-# which runs every turn, and make C3's cacheable prefix depend on the contents
-# of a table. C1's corpus-gap text already reports coverage at the point a
-# company is actually named, which is the only point it is useful.
+# C5 · `lookup_company` was cut (a registry can't resolve "the iPhone maker"
+# either, so the model was always going to recognise the company itself; a
+# sixth tool would only have added routing risk against C2's gate). Coverage
+# is deliberately not enumerated below — that would put a Postgres read in
+# `_system_message()`, which runs every turn, and tie C3's cacheable prefix
+# to the contents of a table. C1's corpus-gap text reports it instead, at the
+# point a company is actually named.
 
 SYSTEM_PROMPT = """You are a financial research assistant. You answer questions about public companies using SEC filings, live market data, and the financial web.
 
@@ -244,6 +219,19 @@ CHARS_PER_TOKEN = 4
 # k=12 searches can exceed it on their own, and should.
 KEEP_RECENT_TOOL_ROUNDS = 2
 
+# But "recent" is not "unlimited". Found live on C4a's first gate run: asked to
+# compare four companies, the model fired all eight k=12 searches as one
+# parallel round rather than four sequential ones — 65k tokens in a single
+# AIMessage's tool calls, all of it "the last round" and so all of it exempt,
+# leaving the guard nothing to do. The exemption above was sized for a couple
+# of fresh searches (~16k tokens' worth), not for however many a model chooses
+# to parallelize into one turn. Past this ceiling, the protected round is
+# trimmed too — oldest tool call first, same as everything else — down to its
+# own wider budget rather than passed through whole. 3x the normal budget:
+# comfortably above the two-searches case the design already accepts, not
+# unbounded.
+PROTECTED_ROUND_BUDGET_TOKENS = 3 * TOOL_RESULT_BUDGET_TOKENS
+
 # Below this, eliding costs more in confusion than it saves in tokens — a
 # quote, an error sentence, or a corpus-gap notice is nearly all signal.
 MIN_ELIDABLE_CHARS = 400
@@ -296,6 +284,33 @@ def _elision_stub(message: ToolMessage, size: int) -> str:
     )
 
 
+def _elide_pass(
+    trimmed: list[AnyMessage], total: int, target: int, eligible: set[str]
+) -> tuple[int, int, int]:
+    """One oldest-first elision pass over `trimmed`, in place.
+
+    `eligible` is the set of `tool_call_id`s this pass may touch — the two
+    passes in `trim_tool_results` differ only in which set that is. Returns
+    the updated `(total, elided_count, freed_chars)`.
+    """
+    elided = 0
+    freed = 0
+    for index, message in enumerate(trimmed):
+        if total <= target:
+            break
+        if not isinstance(message, ToolMessage) or message.tool_call_id not in eligible:
+            continue
+        size = content_chars(message.content)
+        if size < MIN_ELIDABLE_CHARS:
+            continue
+        stub = _elision_stub(message, size)
+        trimmed[index] = message.model_copy(update={"content": stub})
+        total -= size - len(stub)
+        elided += 1
+        freed += size - len(stub)
+    return total, elided, freed
+
+
 def trim_tool_results(messages: list[AnyMessage]) -> list[AnyMessage]:
     """Elide old tool-result bodies until the conversation fits the budget.
 
@@ -306,30 +321,33 @@ def trim_tool_results(messages: list[AnyMessage]) -> list[AnyMessage]:
 
     Under budget, the original list is returned unchanged, which is the case
     for every question that does not fan out.
+
+    **A second pass reaches into the protected rounds themselves, past
+    `PROTECTED_ROUND_BUDGET_TOKENS`.** "Recent" is not "unlimited": a model
+    that parallelizes many searches into one round can make that single round
+    dwarf the budget on its own, and the first pass has nothing left to trim
+    once the whole conversation is inside the protected window. Same rule,
+    wider ceiling — the newest work is still favoured, just not exempted past
+    a point.
     """
-    budget = TOOL_RESULT_BUDGET_TOKENS * CHARS_PER_TOKEN
+    all_ids = {m.tool_call_id for m in messages if isinstance(m, ToolMessage)}
     total = tool_result_chars(messages)
+    budget = TOOL_RESULT_BUDGET_TOKENS * CHARS_PER_TOKEN
     if total <= budget:
         return list(messages)
 
     protected = _protected_tool_call_ids(messages, KEEP_RECENT_TOOL_ROUNDS)
     trimmed = list(messages)
-    elided = 0
-    freed = 0
 
-    for index, message in enumerate(trimmed):
-        if total <= budget:
-            break
-        if not isinstance(message, ToolMessage) or message.tool_call_id in protected:
-            continue
-        size = content_chars(message.content)
-        if size < MIN_ELIDABLE_CHARS:
-            continue
-        stub = _elision_stub(message, size)
-        trimmed[index] = message.model_copy(update={"content": stub})
-        total -= size - len(stub)
-        elided += 1
-        freed += size - len(stub)
+    total, elided, freed = _elide_pass(trimmed, total, budget, all_ids - protected)
+
+    protected_ceiling = PROTECTED_ROUND_BUDGET_TOKENS * CHARS_PER_TOKEN
+    if total > protected_ceiling:
+        total, more_elided, more_freed = _elide_pass(
+            trimmed, total, protected_ceiling, protected
+        )
+        elided += more_elided
+        freed += more_freed
 
     if elided:
         logger.info(

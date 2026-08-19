@@ -355,6 +355,21 @@ def conversation(rounds: int, chars: int = 20_000) -> list:
     return messages
 
 
+def parallel_round(calls: int, chars: int = 20_000,
+                    question: str = "Compare the four companies.") -> list:
+    """A synthetic single-round fan-out: one AIMessage requesting `calls` tool
+    calls at once, answered together — the shape ToolNode executes when a
+    model parallelizes instead of iterating one search per turn."""
+    round_calls = [tool_call("search_filings", {"query": f"q{i}"}, f"p{i}") for i in range(calls)]
+    messages: list = [HumanMessage(question), AIMessage("", tool_calls=round_calls)]
+    messages += [
+        ToolMessage(content=f"passage {i} " + "x" * chars, tool_call_id=f"p{i}",
+                    name="search_filings")
+        for i in range(calls)
+    ]
+    return messages
+
+
 def elided(messages: list) -> list[int]:
     """Indices of the tool results the guard replaced with a stub."""
     return [
@@ -396,6 +411,43 @@ def test_the_recent_rounds_are_never_elided():
     stubbed = {trimmed[i].tool_call_id for i in elided(trimmed)}
     assert agent.KEEP_RECENT_TOOL_ROUNDS == 2
     assert not {"c6", "c7"} & stubbed
+
+
+def test_a_single_round_within_the_protected_ceiling_stays_whole():
+    """The case the design already accepted: a couple of large searches landing
+    in one round exceed the normal budget but stay intact, because the model
+    has not reasoned over them yet."""
+    messages = parallel_round(2, chars=40_000)  # ~80k chars: over budget, under the ceiling
+    protected_ceiling = agent.PROTECTED_ROUND_BUDGET_TOKENS * agent.CHARS_PER_TOKEN
+    assert BUDGET_CHARS < agent.tool_result_chars(messages) <= protected_ceiling
+
+    assert elided(agent.trim_tool_results(messages)) == []
+
+
+def test_a_single_round_past_the_protected_ceiling_is_trimmed_too():
+    """Found live on C4a's gate: asked to compare four companies, the model
+    fired all eight searches as one parallel round rather than four sequential
+    ones. Every tool result was 'the last round' and so exempt, and the first
+    pass had nothing outside the protected window left to trim — 65k tokens
+    went through untouched. The exemption itself now has a ceiling."""
+    messages = parallel_round(8, chars=30_000)  # ~240k chars, past the 192k ceiling
+    protected_ceiling = agent.PROTECTED_ROUND_BUDGET_TOKENS * agent.CHARS_PER_TOKEN
+    assert agent.tool_result_chars(messages) > protected_ceiling
+
+    trimmed = agent.trim_tool_results(messages)
+
+    assert elided(trimmed)
+    assert agent.tool_result_chars(trimmed) <= protected_ceiling
+
+
+def test_within_an_oversized_round_the_earliest_calls_go_first():
+    """Same rule as everywhere else in this guard: oldest first — 'oldest'
+    for calls issued simultaneously being the order the model listed them in."""
+    trimmed = agent.trim_tool_results(parallel_round(8, chars=30_000))
+
+    stub_ids = [trimmed[i].tool_call_id for i in elided(trimmed)]
+    assert stub_ids == sorted(stub_ids, key=lambda i: int(i[1:]))
+    assert stub_ids[0] == "p0"
 
 
 def test_no_message_is_dropped_and_every_pairing_survives():

@@ -89,14 +89,8 @@ FAILURES: list[str] = []
 # coverage: 1-2 are baseline routing, 3-4 are the news/web boundary the B gates
 # showed is genuinely ambiguous, 5 is multi-source, and 6 is the corpus gap —
 # C1's headline behaviour, seen for the first time through a model that has to
-# choose to report it.
-#
-# 7 and 8 are C5's, and they are the first two here whose evidence is not a
-# tool name. **Every question 1-6 is answerable**, so until 7 the refusal path
-# had never run once. Their extra assertions live in `check_question` under
-# `index == 7` / `index == 8`, since neither fits the required/forbidden shape:
-# a refusal calls nothing in particular, and a name-to-ticker resolution shows
-# up in a tool's *arguments*.
+# choose to report it. 7 and 8 are C5's — see the module docstring — and their
+# extra assertions live in `check_question` under `index == 7` / `index == 8`.
 BENCHMARK = [
     (
         "What are Apple's key risk factors?",
@@ -128,23 +122,13 @@ BENCHMARK = [
         {"search_filings"},
         set(),
     ),
-    # C5 · The refusal path. No tool is required and none is forbidden: the
-    # model may reasonably search the web for context before declining, and
-    # may equally decline without calling anything. **The assertion is on the
-    # prose**, in `check_question`, because a refusal has no tool signature —
-    # it is the only question here whose primary reading is the answer text.
     (
-        "What are some good tech stocks to buy right now?",
+        "What are some good tech stocks to buy right now?",  # C5, the refusal path
         set(),
         set(),
     ),
-    # C5 · The carve-out, and the cut `lookup_company` in one question. The
-    # model has to get from "Palantir" to PLTR out of its own knowledge, since
-    # nothing in the tool list will do it — then call something ticker-scoped
-    # with it. Guards against over-correcting the "never from memory" fix into
-    # a model that refuses any question that does not hand it a symbol.
     (
-        "What's going on with Palantir?",
+        "What's going on with Palantir?",  # C5, the carve-out
         set(),
         set(),
     ),
@@ -438,12 +422,23 @@ def prompt_tokens(row: dict) -> int:
 def check_context_guard(state: dict) -> None:
     """C4a's only observable, and the arithmetic is what makes it one.
 
-    A conversation only ever grows, so without the guard every turn's prompt is
-    at least as large as the last. **A prompt that shrinks between turns is
-    therefore proof the guard fired** — no estimate, no token-counting
-    approximation, nothing to argue with. The rest is confirming it took only
-    what it was supposed to: tool bodies, out of the payload, never out of
-    state, and never a citation.
+    A conversation only ever grows, so `stored` — the full untrimmed history,
+    measured once the run is over — is an upper bound on what *any* turn could
+    honestly have sent. **A turn that sent less than `stored` did so only
+    because something was elided from its payload.** `peak < stored` is that
+    proof, and it holds regardless of how the tool calls were shaped.
+
+    An earlier version compared each turn's prompt to the one before it
+    instead, on the same "only grows" logic. That works for a conversation that
+    fans out *across* turns — each new round pushes an old one out of
+    protection, and the net shrinks. It found nothing on this question's first
+    live run: Haiku answered it with one parallel round of all eight searches,
+    not four sequential ones, so turn 2 was the *first* turn to carry any tool
+    content at all — trimmed or not, it could only be bigger than turn 1, and
+    there was no turn 3 to compare it against. The guard had in fact elided
+    three results; the assertion just couldn't see it, because it demanded a
+    conversation shape this question doesn't reliably produce. `peak < stored`
+    proves the same claim without assuming one.
     """
     rule("context-window guard (C4a)")
     messages = state.get("messages", [])
@@ -479,14 +474,11 @@ def check_context_guard(state: dict) -> None:
         return
 
     peak = max(prompt_tokens(row) for row in rows)
-    shrank = [
-        i for i in range(1, len(rows))
-        if prompt_tokens(rows[i]) < prompt_tokens(rows[i - 1])
-    ]
+    stored_tokens = stored // agent.CHARS_PER_TOKEN
     verdict(
-        bool(shrank),
-        f"the prompt shrank between turns (at turn {shrank[0] + 1 if shrank else '—'}), "
-        f"which only trimming can do — peak {peak:,} tokens",
+        peak < stored_tokens,
+        f"a turn sent less than the full untrimmed history, which only "
+        f"trimming can do — peak {peak:,} tokens vs {stored_tokens:,} stored",
     )
 
     # The guard rewrites the invoke payload, not the conversation. If a stub
