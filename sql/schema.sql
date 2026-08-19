@@ -54,3 +54,50 @@ CREATE INDEX IF NOT EXISTS chunks_accession_idx ON chunks (accession_number);
 CREATE INDEX IF NOT EXISTS chunks_section_idx   ON chunks (section);
 CREATE INDEX IF NOT EXISTS filings_ticker_form_year_idx
     ON filings (ticker, form_type, fiscal_year);
+
+-- ---------------------------------------------------------------------------
+-- F1 · XBRL company facts — the numeric spine.
+--
+-- Every filing is inline XBRL: each figure in the statements is wrapped in a
+-- tag naming its us-gaap concept, unit and period. app/parser.py strips those
+-- (get_text keeps "416,161" and discards the tag), which is why numbers in the
+-- chunk corpus are prose. This table holds the same audited figures as data,
+-- fetched from SEC's companyfacts API, with the accession they were reported
+-- in so a number cites the exact filing.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS company_facts (
+    id               bigserial PRIMARY KEY,
+    cik              text NOT NULL,
+    ticker           text NOT NULL,
+    concept          text NOT NULL,      -- us-gaap tag, e.g. 'NetIncomeLoss'
+    unit             text NOT NULL,      -- 'USD' | 'USD/shares' | 'shares'
+
+    -- NULL for instant facts (balance-sheet items are a point in time).
+    period_start     date,
+    period_end       date NOT NULL,
+    period_type      text NOT NULL,      -- 'annual' | 'quarterly' | 'instant'
+
+    -- Calendar year of period_end, and named for exactly what it is. It
+    -- coincides with the filer's own fiscal-year label for most companies but
+    -- is not guaranteed to, and calling it fiscal_year would invite a
+    -- confidently wrong number. Tools label periods by their end date instead.
+    calendar_year    int  NOT NULL,
+
+    value            numeric NOT NULL,
+    form             text NOT NULL,      -- '10-K' | '10-Q'
+    accession_number text NOT NULL,      -- becomes the citation
+    filed_date       date NOT NULL,
+
+    -- NULLS NOT DISTINCT needs Postgres 15+; we run pg16. Under plain UNIQUE,
+    -- Postgres treats NULLs as distinct, so every instant fact would insert
+    -- again on every backfill — silently, with no error and no duplicate key.
+    UNIQUE NULLS NOT DISTINCT (cik, concept, unit, period_start, period_end)
+);
+
+-- The access pattern: one ticker, one concept, a period series, newest first.
+CREATE INDEX IF NOT EXISTS company_facts_lookup_idx
+    ON company_facts (ticker, concept, period_type, period_end DESC);
+
+-- "Which companies have fundamentals?" — the numeric half of the coverage
+-- question, answered the way tools._covered_tickers() answers the text half.
+CREATE INDEX IF NOT EXISTS company_facts_ticker_idx ON company_facts (ticker);

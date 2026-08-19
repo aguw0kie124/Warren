@@ -269,12 +269,20 @@ def test_missing_api_key_is_reported(monkeypatch):
 
 
 def test_every_tool_is_registered_with_a_routing_docstring():
-    assert len(TOOLS) == 5
+    """The whole surface, named rather than counted.
+
+    Named because the number on its own says nothing about what changed, and
+    because every addition here moves two things that were measured against
+    the old list: the model's routing (C2's gate) and C3's cacheable prefix.
+    Adding a tool should require editing this set, and editing it should mean
+    re-running scripts/check_agent.py.
+    """
     names = {t.name for t in TOOLS}
     assert names == {
-        "search_filings", "get_quote", "get_basic_financials",
+        "search_filings", "get_financials", "get_quote", "get_basic_financials",
         "get_company_news", "web_search",
     }
+    assert len(TOOLS) == len(names)   # no duplicate registration
     for t in TOOLS:
         # The docstring is the routing logic, so an empty one is a real defect.
         assert t.description and len(t.description) > 200

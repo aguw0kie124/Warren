@@ -31,8 +31,9 @@ from typing import Literal
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from app import finnhub, retriever, websearch
+from app import finnhub, fundamentals, retriever, websearch
 from app.db import get_conn
+from app.edgar import filing_index_url
 from app.parser import SECTIONS_10K, SECTIONS_10Q
 
 logger = logging.getLogger(__name__)
@@ -485,10 +486,168 @@ def web_search(query: str, days: int | None = None) -> tuple[str, list[Citation]
     return "\n\n".join([header, *blocks]), citations
 
 
+# ---------------------------------------------------------------------------
+# get_financials
+# ---------------------------------------------------------------------------
+
+
+class FinancialsArgs(BaseModel):
+    ticker: str = Field(description="Stock ticker symbol, e.g. 'AAPL'.")
+    statement: str | None = Field(
+        default="income",
+        description="Which statement: 'income', 'balance', or 'cash_flow'. "
+        "Ignored when `concept` is given.",
+    )
+    concept: str | None = Field(
+        default=None,
+        description="A specific us-gaap tag to pull as a series instead of a "
+        "whole statement, e.g. 'DeferredRevenueCurrent'. Only use this when "
+        "the question asks for a line the three statements do not carry.",
+    )
+    period: str = Field(
+        default="annual",
+        description="'annual' or 'quarterly'.",
+    )
+    limit: int = Field(
+        default=5,
+        description=f"How many periods, newest first (1-{fundamentals.MAX_PERIODS}).",
+    )
+
+
+def _format_value(value, unit: str) -> str:
+    """One figure, scaled by its own unit.
+
+    Per row, never per table: earnings per share arrives as `USD/shares` while
+    everything around it is `USD`, so a single scale factor renders $6.08 as
+    0.0 next to revenue in billions — which reads as a company that earned
+    nothing rather than as a formatting bug.
+    """
+    number = float(value)
+    # Per-share figures and ratios are read at their own magnitude — $4.90 is
+    # $4.90, not 4.90 of anything. Counts and dollars both want abbreviating.
+    if unit in ("USD/shares", "pure"):
+        return f"{number:,.2f}"
+    for scale, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if abs(number) >= scale:
+            return f"{number / scale:,.2f}{suffix}"
+    return f"{number:,.2f}"
+
+
+def _render(statement: fundamentals.Statement) -> str:
+    """The statement as a text table, periods as columns, newest first."""
+    header = "".join(f"{p.isoformat():>16}" for p in statement.periods)
+    lines = [f"{'':<28}{header}"]
+    for row in statement.rows:
+        if not row.concept:
+            # Printed rather than dropped: a blank line is information — either
+            # the company does not report it (Amazon pays no dividend) or the
+            # tag mapping missed it. Silently omitting the row hides both.
+            lines.append(f"{row.label:<28}" + "".join(f"{'—':>16}" for _ in statement.periods))
+            continue
+        cells = "".join(
+            f"{_format_value(row.values[p], row.unit):>16}" if p in row.values
+            else f"{'—':>16}"
+            for p in statement.periods
+        )
+        lines.append(f"{row.label:<28}{cells}")
+    return "\n".join(lines)
+
+
+@tool(args_schema=FinancialsArgs, response_format="content_and_artifact")
+def get_financials(
+    ticker: str,
+    statement: str | None = "income",
+    concept: str | None = None,
+    period: str = "annual",
+    limit: int = 5,
+) -> tuple[str, list[Citation]]:
+    """Get a company's OWN REPORTED financial statements, as a multi-period series.
+
+    Income statement, balance sheet, or cash flow, annual or quarterly, going
+    back to 2009 — the figures the company filed with the SEC and its auditors
+    signed. Use this for anything numeric the company itself reported: revenue,
+    margins, earnings, debt, cash, capital spending, buybacks, and above all
+    for **how any of them changed over time**, which is the one thing no single
+    filing can show.
+
+    Prefer this over `get_basic_financials` whenever the question is about a
+    reported figure or a trend. That tool returns a market-data provider's own
+    computed ratios — P/E, beta, the 52-week range — which are useful for what
+    the market currently thinks and are NOT audited. This one is what the
+    company stated. When a question needs both ("is it expensive given how it
+    has grown"), call both and say which number came from where.
+
+    Coverage is wider than the filings corpus: a company can have full
+    financial history here while `search_filings` reports a corpus gap for its
+    risk factors. That is expected, not a contradiction — the two cover
+    different things.
+
+    Periods are labelled by their END DATE, not by a fiscal-year number,
+    because fiscal years differ between companies and the end date is
+    unambiguous. A blank cell means the company did not report that line.
+    """
+    symbol = ticker.strip().upper()
+    if symbol not in fundamentals.covered_tickers():
+        return _fail(
+            f"NO FUNDAMENTALS: {symbol} has no XBRL financial data stored. It may "
+            f"be a foreign private issuer (which files 20-F rather than 10-K), a "
+            f"recent listing, or simply not in the backfilled universe. Say so "
+            f"rather than estimating the numbers."
+        )
+
+    if period not in fundamentals.VALID_PERIODS:
+        return _fail(
+            f"Unknown period {period!r}. Valid values are "
+            f"{' and '.join(fundamentals.VALID_PERIODS)}."
+        )
+
+    if concept:
+        result = fundamentals.load_concept(symbol, concept.strip(), period, limit)
+        if not result.resolved:
+            return _fail(
+                f"{symbol} reports no us-gaap concept named {concept!r}. Check the "
+                f"tag name, or ask for a whole statement instead."
+            )
+    else:
+        if statement not in fundamentals.STATEMENTS:
+            return _fail(
+                f"Unknown statement {statement!r}. Valid values are: "
+                f"{', '.join(fundamentals.STATEMENTS)}."
+            )
+        result = fundamentals.load_statement(symbol, statement, period, limit)
+
+    if not result.periods:
+        return _fail(
+            f"No {period} periods are stored for {symbol}, so no statement can be "
+            f"built."
+        )
+
+    # One citation per filing that reported these periods. Built from the
+    # accession, so it resolves even for a company whose filing text was never
+    # ingested — which is the normal case here.
+    citations = [
+        Citation(
+            type="filing",
+            label=f"{symbol} {form}, XBRL financial data, filed {filed.isoformat()}",
+            source_url=filing_index_url(result.cik, accession),
+        )
+        for accession, form, filed in dict.fromkeys(result.sources.values())
+    ]
+
+    what = concept or f"{statement} statement"
+    header = f"{symbol} {what}, {period}, as reported to the SEC:"
+    footer = (
+        "Figures are the company's own audited filings. Blank cells mean the "
+        "company did not report that line."
+    )
+    return "\n".join([header, "", _render(result), "", footer]), citations
+
+
 # The list C2 binds to the model. Adding a capability to this agent means
 # appending one entry here — never touching the graph.
 TOOLS = [
     search_filings,
+    get_financials,
     get_quote,
     get_basic_financials,
     get_company_news,

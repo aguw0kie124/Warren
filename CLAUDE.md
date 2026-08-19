@@ -17,8 +17,13 @@ An AI-driven financial research platform. A user asks a natural-language questio
 | **C** | LangGraph agent — ReAct loop | complete (C4c cancelled, C5's `lookup_company` cut) |
 | **D** | FastAPI service — `POST /query`, `GET /health`, `GET /threads/{id}` | complete |
 | **E** | Query router — 4-class pre-dispatch | **complete, gated live 2026-08-19** (34/34; benchmark and `--memory` re-run clean) |
+| **F1/F2** | XBRL fundamentals + `get_financials` | **complete, gated 2026-08-19** (50/50; benchmark and router re-run clean) |
 
-**Corpus:** 4 tickers (AAPL, META, MSFT, TSLA), 13 filings, 806 chunks. Exactly **one 10-K per ticker** — the other nine are 10-Qs — so **no year-over-year comparison of filings is answerable for any covered company**. Write gate questions against what is ingested, not against what the ingestion policy says it collects.
+**Corpus, text:** 4 tickers (AAPL, META, MSFT, TSLA), 13 filings, 806 chunks.
+
+**Corpus, numeric:** 386 companies, 3.6M XBRL facts, ~1.7 GB, fiscal 2009–2026. **Coverage is deliberately asymmetric** — one HTTP call buys a company's whole financial history, against ~25s of parse-and-embed per filing — so a company can have full fundamentals and still report a corpus gap for its risk factors. That is the design, not a contradiction; `fundamentals.covered_tickers()` and `tools._covered_tickers()` answer the two halves separately and must not be conflated.
+
+**Corpus, text (detail):** Exactly **one 10-K per ticker** — the other nine are 10-Qs — so **no year-over-year comparison of filings is answerable for any covered company**. Write gate questions against what is ingested, not against what the ingestion policy says it collects.
 
 **Model:** `claude-haiku-4-5-20251001`, pinned to the dated snapshot rather than the alias, so model-scoped gate findings stay attached to a fixed model. Tool routing is the most model-sensitive thing here — if a routing failure appears, **the first hypothesis is the model, not a docstring bug**. Re-run on `claude-sonnet-5` to separate the two before editing `app/tools.py`.
 
@@ -37,8 +42,9 @@ docker compose down          # add -v to also drop the data volume
 # model at startup — expect ~10s before it answers.
 .venv/bin/python -m uvicorn app.api:app --reload
 
-# Ingestion
+# Ingestion — filing text (slow, ~25s/filing) and fundamentals (one call/company)
 .venv/bin/python scripts/ingest.py --ticker AAPL
+.venv/bin/python scripts/backfill_facts.py --tickers-file data/universe_500.txt
 
 # Tests — offline, no DB / keys / model needed
 .venv/bin/python -m pytest
@@ -48,7 +54,7 @@ docker compose down          # add -v to also drop the data volume
 docker compose exec db psql -U postgres -d research
 ```
 
-Every step has a gate: `scripts/check_{db,tickers,edgar,parser,chunker,retriever,finnhub,websearch,tools,agent,api,router}.py`, sharing primitives from `scripts/_gate.py`. `check_router.py` has `--classify-only` (cheap: labels, no answers) and `--cost` (prices the routed graph against `build_graph(router=False)`). `check_agent.py` carries three modes — no flag is the benchmark set, `--guard` is the context guard, `--memory` is the checkpointer; `--show-thread ID` is free. `check_agent.py` and `check_api.py` cost money.
+Every step has a gate: `scripts/check_{db,tickers,edgar,parser,chunker,retriever,finnhub,websearch,tools,agent,api,router,data}.py`, sharing primitives from `scripts/_gate.py`. `check_router.py` has `--classify-only` (cheap: labels, no answers) and `--cost` (prices the routed graph against `build_graph(router=False)`). `check_agent.py` carries three modes — no flag is the benchmark set, `--guard` is the context guard, `--memory` is the checkpointer; `--show-thread ID` is free. `check_agent.py` and `check_api.py` cost money.
 
 ## Architecture
 
@@ -119,11 +125,29 @@ Four classes. Three of them terminate at `respond_node` — one model call, a sm
 - **The advisory and refusal clauses moved out of `SYSTEM_PROMPT` into `ADVISORY_PROMPT`.** A question asking for a pick no longer reaches the research prompt, so carrying the refusal there would be dead text riding on every expensive turn. Side effect: the research prefix shrank from ~3.4k to ~3.16k tokens, moving *further* below the 4096 cache floor. Already inert, so nothing was lost — but **do not pad it back**, and see the cache constraint below.
 - **Measured on the first live run:** 16/16 classifications correct including all four traps; the routed graph is **7.3x cheaper** than the pre-router loop on questions that need no evidence (`$0.0037` vs `$0.0271` over four). Research questions pay the classifier and save nothing — F's `runs` table is what will show the mix.
 
+### F1/F2 · XBRL fundamentals — the audited numbers as data
+
+Every filing is inline XBRL: each figure in the statements is wrapped in a tag naming its us-gaap concept, unit and period (the AAPL FY2025 10-K carries 969 of them). `parser.html_to_lines` calls `get_text()`, which keeps `416,161` and drops the tag — which is why numbers reach the chunk corpus as prose. `app/xbrl.py` takes the same figures from SEC's free `companyfacts` API, `app/fundamentals.py` arranges them into statements, and `get_financials` serves them.
+
+Five findings, each of which produced a plausible wrong answer before it was fixed:
+
+- **`fy` and `fp` describe the *filing*, not the fact.** A 10-K restates its prior years, so AAPL's FY2025 filing stamps `fy=2025` on facts covering 2022-23, 2023-24 and 2024-25. Reading it labels 2023's revenue as FY2025 — a real number under the wrong year. **Everything is derived from `start`/`end`.** `check_data.py` asserts the three figures that catch it.
+- **Tag fallthrough must be per period, not per line.** NVIDIA reports revenue under `RevenueFromContractWithCustomerExcludingAssessedTax` for one early year and `Revenues` since; "first candidate with any data" rendered four blank revenue years beneath a full gross-profit row. `_resolve_line` fills period by period and records every tag that contributed, so a re-tagged line reassembles. Capital expenditure has the same break at FY2020.
+- **Periods must be bounded by `CURRENT_DATE`.** XBRL carries forward-dated *assumptions* — Nucor tags a health-care trend rate over 2027 in a 2011 filing — and without the bound that was Nucor's most recent "annual period", rendering a blank 2027 column and dropping a real year.
+- **A ticker names the current registrant, not the whole history.** SEC maps XOM to CIK 2115436 "ExxonMobil Holdings Corp", a successor entity, not CIK 34088 which holds decades of Exxon filings. 3 of 386 companies are in this position (XOM, HONA, CBRS). Nothing follows the chain — SEC publishes no predecessor link, and guessing by name would attribute one company's numbers to another. The tool reports the absence.
+- **`company_tickers.json` is only partly size-ordered.** It is ordered by market cap for recent CIKs, but companies registered long ago fall into a block near index 7100+: Exxon (CIK 34088) at 7424, JPMorgan at 7147, McDonald's at 7177, while Chevron sits at 31. A top-N slice silently misses mega-caps *by age of registration* — 22 of 128 well-known large caps were absent. `data/universe_500.txt` carries an explicit supplement for that reason.
+
+Two more rules worth keeping:
+
+- **Nothing is derived.** AMD and AbbVie never tag `Liabilities`; total liabilities could be computed from `LiabilitiesAndStockholdersEquity` minus equity, and would be correct — but it would put a figure in a statement that appears in no filing. The line stays blank.
+- **A blank line has two causes and they must not be conflated.** Accenture has no gross profit, Allstate no R&D, Amazon no dividend — correct absences. A mapping gap looks different, and the gate therefore asserts only the genuinely universal lines (revenue, total assets, net income, operating cash flow) and prints the rest for a human.
+
 ### Citations are assembled in code, never by the LLM
 
 Models mangle URLs and invent accession numbers; the retriever already knows ground truth. Each tool is `@tool(response_format="content_and_artifact")` and returns `(text, list[Citation])`. The `Citation` objects ride on the `ToolMessage` **without entering the model's context**, tagged `filing` / `news` / `web` so an audited SEC filing is distinguishable from a news article.
 
 - **The `[n]` markers in a tool's text index its artifact list position for position**, so there is deliberately **no de-duplication inside a tool call**. De-duplication happens once, downstream, where the whole answer's list is assembled.
+- **XBRL citations are built from cik + accession**, not looked up. A fact names the filing it was reported in, but the corpus usually holds no `filings` row for it — under asymmetric coverage that is the normal case. `edgar.filing_index_url` builds the EDGAR index URL from ids alone, so a number cites an openable filing for a company whose text was never ingested. **The accession's own prefix is the filing agent's CIK, not the company's**, so the CIK is carried through `Statement`.
 - **`get_quote` and `get_basic_financials` return no citations.** There is no article behind a quote, and a fabricated URL in a list whose entire value is that every entry resolves is worse than no entry.
 
 ### Tool failures are returned as text, never raised
@@ -184,10 +208,11 @@ Per-step manual verification through the `check_*.py` gates is the **primary** m
 
 Full design, gates, and rationale in [docs/phase-2-plan.md](docs/phase-2-plan.md). Ordered; each module stops for human verification before the next begins.
 
-- **F — Observability and cost accounting.** A `runs` ledger in Postgres (tokens, cache, dollars, latency, route, tool calls), `app/cost.py` for pricing, LangSmith tracing as an env toggle.
-- **G — Streaming.** `POST /query/stream` over SSE — worker thread + queue, heartbeats, typed events for tool calls, citations, tokens, and notices. `POST /query` unchanged.
-- **H — Coverage.** ~25-ticker seed backfill, on-demand ingestion triggered by the corpus gap (with a failure cache), and price history via a `yfinance` sibling client plus a `GET /prices/{symbol}` endpoint for charts.
-- **I — React UI.** Vite + React + TS in `ui/`, Perplexity-Finance-shaped: streaming answer, live tool-activity chips, a sources rail that fills as citations arrive, an explicit unsourced band, price chart, and a per-question cost footer.
+- **F3/F4 — the rest of the data layer.** Price history via a `yfinance` sibling client and `get_price_history` (a summary, never raw bars); widening the text corpus with 10-K Item 8 and the notes; a 25-ticker text backfill; on-demand ingestion triggered by the corpus gap, with a failure cache so a filer the parser cannot handle is not re-attempted every turn.
+- **G — Observability and cost accounting.** A `runs` ledger in Postgres (tokens, cache, dollars, latency, route, tool calls) and LangSmith tracing as an env toggle. `app/cost.py` already exists, pulled forward for E's gate.
+- **H — Retrieval quality.** A retrieval-only golden set scored on recall@k and MRR — arithmetic, so no LLM judge and no per-run cost — then cross-encoder reranking, k tuning and per-query-type RRF weighting measured against that baseline rather than adopted on faith.
+
+**Deferred, not cancelled:** the ticker page (profile, chart, statement tables, peers) and its REST endpoints; SSE streaming; the React UI; 8-K and earnings surprises. F leaves the seams — `company_facts` and `prices` are queried by ticker and period, so REST endpoints over them are thin SELECTs; `sic`/`sicDescription` arrive free in the submissions payload `app/edgar.py` already fetches, so peers is one parse function away.
 
 Also planned alongside: `app/ratelimit.py` (one class, separate instances per service — a shared limiter would throttle EDGAR because Finnhub was busy). `scripts/_gate.py` is **done** — the shared `rule` / `verdict` / `note` / `indent` / `summary` / `exit_code` primitives, extracted when E made this the twelfth gate. New gates import it; the older eleven still carry their own copies and can be migrated opportunistically.
 

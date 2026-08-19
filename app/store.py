@@ -13,6 +13,7 @@ from pgvector import Vector
 from psycopg import Connection
 
 from app.chunker import Chunk
+from app.xbrl import Fact
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,62 @@ ON CONFLICT (accession_number, chunk_index) DO UPDATE SET
     content   = EXCLUDED.content,
     embedding = EXCLUDED.embedding
 """
+
+
+# F1 · The conflict target names the columns of the UNIQUE NULLS NOT DISTINCT
+# constraint, so instant facts (period_start IS NULL) collide with themselves
+# rather than inserting again on every backfill.
+#
+# **The WHERE clause is the restatement rule.** A later filing that revises a
+# period supersedes the earlier one; an earlier filing arriving out of order
+# (a backfill re-run, a resumed job) leaves the newer figure alone. Without it,
+# whichever run happened last would win, which is not the same thing.
+_UPSERT_FACT = """
+INSERT INTO company_facts (
+    cik, ticker, concept, unit, period_start, period_end,
+    period_type, calendar_year, value, form, accession_number, filed_date
+)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+ON CONFLICT (cik, concept, unit, period_start, period_end) DO UPDATE SET
+    ticker           = EXCLUDED.ticker,
+    period_type      = EXCLUDED.period_type,
+    calendar_year    = EXCLUDED.calendar_year,
+    value            = EXCLUDED.value,
+    form             = EXCLUDED.form,
+    accession_number = EXCLUDED.accession_number,
+    filed_date       = EXCLUDED.filed_date
+WHERE EXCLUDED.filed_date > company_facts.filed_date
+"""
+
+
+def existing_fact_ciks(conn: Connection) -> set[str]:
+    """Which filers already have facts — what makes a backfill resumable."""
+    return {row[0] for row in conn.execute("SELECT DISTINCT cik FROM company_facts")}
+
+
+def upsert_facts(conn: Connection, facts: Sequence[Fact]) -> int:
+    """Write XBRL facts. Returns the number offered, not the number changed.
+
+    Offered rather than changed on purpose: a re-run legitimately updates
+    nothing, and `executemany` cannot report per-row conflict outcomes anyway.
+    The idempotency claim this supports is about *row counts in the table*,
+    which is what `scripts/check_data.py` measures.
+    """
+    if not facts:
+        return 0
+
+    conn.cursor().executemany(
+        _UPSERT_FACT,
+        [
+            (
+                f.cik, f.ticker, f.concept, f.unit, f.period_start, f.period_end,
+                f.period_type, f.calendar_year, f.value, f.form,
+                f.accession_number, f.filed_date,
+            )
+            for f in facts
+        ],
+    )
+    return len(facts)
 
 
 def existing_accessions(conn: Connection, accessions: Sequence[str]) -> set[str]:

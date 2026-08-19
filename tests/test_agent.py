@@ -760,16 +760,19 @@ def test_nothing_touches_postgres_until_a_checkpointed_graph_is_asked_for(monkey
 # docstrings.
 
 
-def test_c5_added_no_tools():
-    """The bound tool list is unchanged, which is the whole claim of C5's scoping.
+def test_lookup_company_is_still_cut():
+    """C5's actual claim, which survives F adding tools for other reasons.
 
-    `lookup_company` was cut precisely so C2's routing gate and C3's cache
-    prefix would still describe the shipped system. A sixth entry here
-    invalidates both, quietly.
+    This test used to assert the list was exactly five entries — the point
+    being that `lookup_company` was cut so C2's routing gate and C3's cache
+    prefix still described the shipped system. F1/F2 added `get_financials`
+    for a capability nothing else had, which is a different case from adding
+    one that duplicates what the model already does. What C5 settled is that
+    a *registry lookup* is not worth a tool slot, and that is what is pinned
+    here; the count itself is pinned in tests/test_tools.py, where the whole
+    surface is named rather than counted.
     """
-    names = {tool.name for tool in agent.TOOLS}
-    assert len(agent.TOOLS) == 5
-    assert "lookup_company" not in names
+    assert "lookup_company" not in {tool.name for tool in agent.TOOLS}
 
 
 def test_the_prompt_separates_recognising_a_company_from_asserting_about_it():

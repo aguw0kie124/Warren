@@ -226,3 +226,22 @@ def fetch_filing(filing: Filing, force: bool = False) -> str:
     path.write_text(text, encoding="utf-8")
     logger.info("saved %s (%.1f MB)", path.name, len(text) / 1_048_576)
     return text
+
+
+def filing_index_url(cik: str, accession_number: str) -> str:
+    """The EDGAR index page for one filing, built from ids alone.
+
+    F2 needs this because an XBRL fact carries an accession but the `filings`
+    table may hold no row for it — under asymmetric coverage that is the normal
+    case, not an edge one. The archive path is deterministic, so a citation can
+    point at a real, openable filing without anything having been ingested.
+
+    The index page rather than the primary document: which file inside the
+    filing is the 10-K is not derivable from the accession, and the index lists
+    every document including the XBRL data the number came from.
+    """
+    plain = accession_number.replace("-", "")
+    return (
+        f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{plain}/"
+        f"{accession_number}-index.htm"
+    )
