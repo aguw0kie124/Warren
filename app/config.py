@@ -59,6 +59,16 @@ class Settings(BaseSettings):
     # a clipped one. Set it explicitly.
     llm_max_tokens: int = 8192
 
+    # --- API (Module D) ---
+    # The only variable D1 adds, and it exists for the gate rather than for
+    # operations. app/api.py encodes one string at startup so the several-second
+    # model load happens before the first request, which also makes the state
+    # that once segfaulted the interpreter — parallel search_filings in a *cold*
+    # process — unreachable through the API. scripts/check_api.py sets this
+    # false to start a genuinely cold server and reach that state on purpose;
+    # without the switch its burst case would silently test less than it claims.
+    api_warm_embeddings: bool = True
+
     # --- paths ---
     raw_dir: Path = PROJECT_ROOT / "data" / "raw"
     cache_dir: Path = PROJECT_ROOT / "data" / "cache"
