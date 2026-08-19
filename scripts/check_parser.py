@@ -10,10 +10,15 @@ populate it.
 import argparse
 import logging
 import re
+import sys
 from pathlib import Path
 
-from app.config import settings
-from app.parser import SECTION_UNKNOWN, parse_sections
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _gate import exit_code, rule, summary, verdict  # noqa: E402
+
+from app.config import settings  # noqa: E402
+from app.parser import SECTION_UNKNOWN, parse_sections  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -35,7 +40,6 @@ def main() -> None:
         print(f"No filings in {settings.raw_dir}. Run scripts/check_edgar.py first.")
         return
 
-    problems = 0
     for path in files:
         meta = NAME_RE.match(path.name)
         if not meta:
@@ -43,12 +47,11 @@ def main() -> None:
             continue
         form = meta["form"]
 
-        print(f"\n=== {path.name} ===")
+        rule(path.name)
         sections = parse_sections(path.read_text(errors="replace"), form)
 
-        if SECTION_UNKNOWN in sections:
-            problems += 1
-            print("  [BAD] fell back to whole-document (no sections identified)")
+        if not verdict(SECTION_UNKNOWN not in sections,
+                        "sections identified (no whole-document fallback)"):
             continue
 
         for key, body in sections.items():
@@ -56,9 +59,7 @@ def main() -> None:
             # 10-Q risk factors are legitimately short ("no material changes").
             if form == "10-Q" and key == "Item 1A Risk Factors":
                 floor = 0
-            ok = len(body) >= floor
-            problems += not ok
-            print(f"  [{'ok ' if ok else 'BAD'}] {key:<24} {len(body):>8,} chars")
+            verdict(len(body) >= floor, f"{key:<24} {len(body):>8,} chars")
 
             first = body.split("\n", 1)[0]
             print(f"        heading: {first[:70]!r}")
@@ -67,7 +68,8 @@ def main() -> None:
             print(f"\n  --- {args.show}, first {args.chars} chars ---")
             print("  " + sections[args.show][: args.chars].replace("\n", "\n  "))
 
-    print("\nA4:", "PASS" if problems == 0 else f"FAIL ({problems} problem(s))")
+    summary()
+    raise SystemExit(exit_code())
 
 
 if __name__ == "__main__":

@@ -72,16 +72,19 @@ import logging
 import re
 import subprocess
 import sys
+from pathlib import Path
 from uuid import uuid4
 
-from app import agent, finnhub
-from app.config import settings
-from app.db import close_pool
-from app.sec_http import close_client, sec_get
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _gate import exit_code, indent, rule, summary, verdict  # noqa: E402
+
+from app import agent, finnhub  # noqa: E402
+from app.config import settings  # noqa: E402
+from app.db import close_pool  # noqa: E402
+from app.sec_http import close_client, sec_get  # noqa: E402
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
-
-FAILURES: list[str] = []
 
 # (question, tools that must be called, tools that must NOT be).
 #
@@ -186,18 +189,6 @@ PICK_NAMES = ("nvidia", "nvda", "apple", "aapl", "microsoft", "msft", "alphabet"
               "google", "googl", "amazon", "amzn", "meta", "tsla", "tesla",
               "broadcom", "avgo", "palantir", "pltr", "advanced micro", "amd",
               "salesforce", "crm", "oracle", "orcl", "netflix", "nflx")
-
-
-def rule(title: str) -> None:
-    print(f"\n{'━' * 78}\n{title}\n{'━' * 78}")
-
-
-def verdict(ok: bool, label: str) -> bool:
-    """Record one check."""
-    print(f"  [{'ok ' if ok else 'BAD'}] {label}")
-    if not ok:
-        FAILURES.append(label)
-    return ok
 
 
 def run_streaming(question: str, thread_id: str | None = None) -> dict:
@@ -331,10 +322,6 @@ def check_question(index: int, question: str, required: set, forbidden: set,
                 print(f"          {citation.source_url}")
 
     return state
-
-
-def indent(text: str, prefix: str = "    │ ") -> str:
-    return "\n".join(prefix + line for line in text.splitlines())
 
 
 def print_usage(state: dict) -> None:
@@ -780,23 +767,19 @@ def main() -> None:
             check_citation_urls(last_state)
             check_prompt_cache(cache_state)
 
-        rule("summary")
-        if FAILURES:
-            print(f"  {len(FAILURES)} check(s) FAILED:")
-            for failure in FAILURES:
-                print(f"    - {failure}")
-            print("\n  Tool-choice failures are docstring bugs. Fix app/tools.py, "
-                  "not app/agent.py.")
-        else:
-            print("  all checks passed — now read the answers themselves: are the "
-                  "filing claims\n  actually supported by the retrieved passages, and "
-                  "is filing data dated?")
+        summary(
+            on_failure="Tool-choice failures are docstring bugs. Fix app/tools.py, "
+                       "not app/agent.py.",
+            on_success="now read the answers themselves: are the filing claims "
+                       "actually supported\n  by the retrieved passages, and is "
+                       "filing data dated?",
+        )
     finally:
         finnhub.close_client()
         close_client()
         close_pool()
 
-    raise SystemExit(1 if FAILURES else 0)
+    raise SystemExit(exit_code())
 
 
 if __name__ == "__main__":

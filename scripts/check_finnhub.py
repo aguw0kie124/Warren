@@ -16,9 +16,15 @@ What you are checking by eye, because none of it is assertable offline:
 
 import argparse
 import logging
+import sys
 from datetime import date, timedelta
+from pathlib import Path
 
-from app.finnhub import (
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _gate import rule  # noqa: E402
+
+from app.finnhub import (  # noqa: E402
     DEFAULT_NEWS_DAYS,
     FinnhubError,
     close_client,
@@ -31,10 +37,6 @@ from app.finnhub import (
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 
 BOGUS_SYMBOL = "ZZQQNOTREAL"
-
-
-def rule(title: str) -> None:
-    print(f"\n{'─' * 70}\n{title}\n{'─' * 70}")
 
 
 def check_quote(symbol: str) -> None:

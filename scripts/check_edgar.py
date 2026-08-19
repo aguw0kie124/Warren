@@ -6,10 +6,16 @@
 
 import argparse
 import logging
+import sys
+from pathlib import Path
 
-from app.edgar import fetch_filing, list_filings, local_path
-from app.sec_http import close_client
-from app.tickers import resolve_ticker
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _gate import exit_code, rule, summary, verdict  # noqa: E402
+
+from app.edgar import fetch_filing, list_filings, local_path  # noqa: E402
+from app.sec_http import close_client  # noqa: E402
+from app.tickers import resolve_ticker  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -24,7 +30,7 @@ def main() -> None:
     print(f"\n{company.name}  (CIK {company.cik})")
 
     # --- A2: annual filings, sanity-checkable against reality ---
-    print("\n=== last 5 10-K filings (A2) ===")
+    rule("last 5 10-K filings (A2)")
     annual = list_filings(company, form_types=("10-K",), years=None, limit=5)
     for f in annual:
         print(
@@ -33,38 +39,35 @@ def main() -> None:
         )
 
     # --- A2: the actual ingestion window ---
-    print(f"\n=== 10-K + 10-Q in the last {args.years} years (the A6 ingest set) ===")
+    rule(f"10-K + 10-Q in the last {args.years} years (the A6 ingest set)")
     window = list_filings(company, years=args.years)
     for f in window:
         print(f"  {f.filing_date}  {f.form_type:<5} FY{f.fiscal_year}  {f.accession_number}")
     print(f"  -> {len(window)} filings")
 
-    if not window:
-        print("\nNo filings found — cannot continue to A3.")
+    if not verdict(bool(window), "filings found (needed to continue to A3)"):
+        summary()
         return
 
     # --- A2: amendments must not leak in ---
     forms = {f.form_type for f in window}
-    exact = forms <= {"10-K", "10-Q"}
-    print(f"\n  [{'ok ' if exact else 'BAD'}] form types are exactly 10-K/10-Q: {sorted(forms)}")
+    verdict(forms <= {"10-K", "10-Q"}, f"form types are exactly 10-K/10-Q: {sorted(forms)}")
 
     # --- A3: download the most recent 10-K ---
     target = annual[0] if annual else window[0]
-    print(f"\n=== fetching {target.form_type} {target.accession_number} (A3) ===")
+    rule(f"fetching {target.form_type} {target.accession_number} (A3)")
     html = fetch_filing(target)
     path = local_path(target)
 
-    looks_like_html = "<" in html[:2000].lower()
-    substantial = len(html) > 100_000  # a real 10-K is megabytes, not kilobytes
-
     print(f"  saved to   {path}")
     print(f"  size       {len(html):,} chars ({len(html) / 1_048_576:.1f} MB)")
-    print(f"  [{'ok ' if looks_like_html else 'BAD'}] content looks like HTML")
-    print(f"  [{'ok ' if substantial else 'BAD'}] content is substantial (>100k chars)")
+    verdict("<" in html[:2000].lower(), "content looks like HTML")
+    # a real 10-K is megabytes, not kilobytes
+    verdict(len(html) > 100_000, "content is substantial (>100k chars)")
     print(f"\n  open in browser:  file://{path}")
     print(f"  source URL:       {target.source_url}")
 
-    print("\nA2/A3:", "PASS" if (exact and looks_like_html and substantial) else "CHECK ABOVE")
+    summary()
 
 
 if __name__ == "__main__":
@@ -72,3 +75,5 @@ if __name__ == "__main__":
         main()
     finally:
         close_client()
+
+    raise SystemExit(exit_code())

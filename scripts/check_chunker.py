@@ -14,14 +14,20 @@ are skipped entirely unless --fetch asks for them.
 import argparse
 import logging
 import re
+import sys
 from collections import Counter
+from pathlib import Path
 
-from app.chunker import chunk_filing
-from app.config import settings
-from app.edgar import fetch_filing, list_filings, local_path
-from app.parser import SECTION_UNKNOWN, parse_sections
-from app.sec_http import close_client
-from app.tickers import resolve_ticker
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _gate import exit_code, rule, summary, verdict  # noqa: E402
+
+from app.chunker import chunk_filing  # noqa: E402
+from app.config import settings  # noqa: E402
+from app.edgar import fetch_filing, list_filings, local_path  # noqa: E402
+from app.parser import SECTION_UNKNOWN, parse_sections  # noqa: E402
+from app.sec_http import close_client  # noqa: E402
+from app.tickers import resolve_ticker  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -58,7 +64,6 @@ def main() -> None:
         print(f"No filings in {settings.raw_dir}. Run scripts/check_edgar.py first.")
         return
 
-    problems = 0
     processed = 0
     try:
         for ticker in tickers:
@@ -75,15 +80,13 @@ def main() -> None:
 
             for filing in filings:
                 processed += 1
-                print(f"\n=== {filing.ticker} {filing.form_type} FY{filing.fiscal_year} "
-                      f"({filing.accession_number}) ===")
+                rule(f"{filing.ticker} {filing.form_type} FY{filing.fiscal_year} "
+                     f"({filing.accession_number})")
 
                 sections = parse_sections(fetch_filing(filing), filing.form_type)
                 chunks = chunk_filing(filing, sections)
 
-                if not chunks:
-                    problems += 1
-                    print("  [BAD] no chunks produced")
+                if not verdict(bool(chunks), "chunks produced"):
                     continue
 
                 if SECTION_UNKNOWN in sections:
@@ -100,9 +103,8 @@ def main() -> None:
                 # chunk_index must be a gapless 0..n-1 run, or ON CONFLICT
                 # idempotency in A6 silently stops matching on re-ingest.
                 indices = [c.chunk_index for c in chunks]
-                if indices != list(range(len(chunks))):
-                    problems += 1
-                    print("  [BAD] chunk_index is not a gapless 0..n-1 sequence")
+                verdict(indices == list(range(len(chunks))),
+                        "chunk_index is a gapless 0..n-1 sequence")
 
                 blanks = {
                     field
@@ -110,11 +112,9 @@ def main() -> None:
                     for field in REQUIRED
                     if getattr(c, field) in (None, "")
                 }
-                if blanks:
-                    problems += 1
-                    print(f"  [BAD] empty metadata fields: {sorted(blanks)}")
-                else:
-                    print("  [ok ] every metadata field populated")
+                verdict(not blanks,
+                        f"every metadata field populated"
+                        + (f" (blank: {sorted(blanks)})" if blanks else ""))
 
                 for chunk in chunks[: args.show]:
                     print(f"\n  --- chunk {chunk.chunk_index} ({chunk.section}) ---")
@@ -125,11 +125,9 @@ def main() -> None:
     finally:
         close_client()
 
-    if not processed:
-        print("\nA5: NO DATA — nothing was checked, which is not a pass.")
-    else:
-        verdict = "PASS" if problems == 0 else f"FAIL ({problems} problem(s))"
-        print(f"\nA5: {verdict} ({processed} filing(s) checked)")
+    verdict(processed > 0, f"{processed} filing(s) checked (NO DATA is not a pass)")
+    summary()
+    raise SystemExit(exit_code())
 
 
 if __name__ == "__main__":

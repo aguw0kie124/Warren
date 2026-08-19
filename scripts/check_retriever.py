@@ -13,11 +13,17 @@ than remembered.
 import argparse
 import json
 import logging
+import sys
+from pathlib import Path
 
-from app.config import settings
-from app.db import close_pool
-from app.retriever import hybrid_search, search
-from app.sec_http import close_client, sec_get
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _gate import exit_code, rule, summary, verdict  # noqa: E402
+
+from app.config import settings  # noqa: E402
+from app.db import close_pool  # noqa: E402
+from app.retriever import hybrid_search, search  # noqa: E402
+from app.sec_http import close_client, sec_get  # noqa: E402
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 
@@ -58,10 +64,9 @@ EXACT_TERMS = [
 def run(label: str, query: str, k: int, **filters) -> list[dict]:
     results = search(query, k=k, **filters)
     flt = ", ".join(f"{k}={v}" for k, v in filters.items()) or "no filter"
-    print(f"\n=== [{label}] {query!r}  ({flt}) ===")
+    rule(f"[{label}] {query!r}  ({flt})")
 
-    if not results:
-        print("  [BAD] no results")
+    if not verdict(bool(results), "results returned"):
         return []
 
     for r in results:
@@ -177,29 +182,35 @@ def main() -> None:
             snapshot += run(label, query, args.k, **filters)
 
         # Filters must actually narrow, not merely be accepted.
-        print("\n=== filter behaviour ===")
+        rule("filter behaviour")
         broad = search("revenue growth", k=20)
         narrow = search("revenue growth", ticker="AAPL", section="Item 7 MD&A", k=20)
         print(f"  unfiltered:            {len(broad):>3} results, "
               f"{len({r.ticker for r in broad})} ticker(s)")
         print(f"  ticker+section filter: {len(narrow):>3} results, "
               f"{len({r.ticker for r in narrow})} ticker(s)")
-        ok = narrow and {r.ticker for r in narrow} == {"AAPL"} \
-            and {r.section for r in narrow} == {"Item 7 MD&A"}
-        print(f"  [{'ok ' if ok else 'BAD'}] filtered results honour every filter")
+        verdict(
+            bool(narrow) and {r.ticker for r in narrow} == {"AAPL"}
+            and {r.section for r in narrow} == {"Item 7 MD&A"},
+            "filtered results honour every filter",
+        )
 
         # A citation nobody can open is not a citation.
-        print("\n=== citation URLs resolve ===")
+        rule("citation URLs resolve")
         urls = sorted({(r.source_url, r.citation) for r in broad[:3]})
         for url, citation in urls:
-            print(f"  [{'ok ' if check_url(url) else 'BAD'}] {citation}\n         {url}")
+            verdict(check_url(url), f"{citation}\n         {url}")
 
         if args.save:
             SNAPSHOT.write_text(json.dumps(snapshot, indent=2))
             print(f"\nsaved {len(snapshot)} result(s) to {SNAPSHOT} for the A8 comparison")
+
+        summary()
     finally:
         close_client()
         close_pool()
+
+    raise SystemExit(exit_code())
 
 
 if __name__ == "__main__":

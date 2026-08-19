@@ -1,4 +1,4 @@
-"""C1 verification: the five tools, called directly with no LLM in the loop.
+"""C1 verification: the tools, called directly with no LLM in the loop.
 
     python scripts/check_tools.py
     python scripts/check_tools.py --ticker MSFT
@@ -21,30 +21,19 @@ there is deliberately no model here.
 
 import argparse
 import logging
+import sys
+from pathlib import Path
 
-from app import finnhub, retriever, websearch
-from app.db import close_pool
-from app.tools import TOOLS, Citation, VALID_SECTIONS, search_filings
-from app.tools import get_basic_financials, get_company_news, get_quote, web_search
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _gate import note, rule, summary, verdict, exit_code  # noqa: E402
+
+from app import finnhub, retriever, websearch  # noqa: E402
+from app.db import close_pool  # noqa: E402
+from app.tools import TOOLS, Citation, VALID_SECTIONS, search_filings  # noqa: E402
+from app.tools import get_basic_financials, get_company_news, get_quote, web_search  # noqa: E402
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
-
-FAILURES: list[str] = []
-
-
-def rule(title: str) -> None:
-    print(f"\n{'─' * 74}\n{title}\n{'─' * 74}")
-
-
-def verdict(ok: bool, label: str) -> bool:
-    print(f"  [{'ok ' if ok else 'BAD'}] {label}")
-    if not ok:
-        FAILURES.append(label)
-    return ok
-
-
-def note(text: str) -> None:
-    print(f"        {text}")
 
 
 def run(tool, **args):
@@ -282,7 +271,7 @@ def check_surface() -> None:
         print(f"  {tool.name:<22} {len(tool.description):>4} chars  {first[:44]}")
         verdict(tool.response_format == "content_and_artifact",
                 f"{tool.name}: returns content + artifact")
-    verdict(len(TOOLS) == 5, "five tools registered")
+    verdict(len(TOOLS) == 6, "six tools registered")
 
 
 def main() -> None:
@@ -305,20 +294,16 @@ def main() -> None:
             check_web(args.show)
         check_bad_input(args.ticker, live=not args.skip_live)
 
-        rule("summary")
-        if FAILURES:
-            print(f"  {len(FAILURES)} check(s) FAILED:")
-            for failure in FAILURES:
-                print(f"    - {failure}")
-        else:
-            print("  all checks passed — read the rendered tool text above before "
-                  "moving to C2;\n  the docstrings and this text are what the model "
-                  "actually routes on.")
+        summary(
+            on_success="read the rendered tool text above before moving to C2; "
+                       "the docstrings\n  and this text are what the model "
+                       "actually routes on.",
+        )
     finally:
         finnhub.close_client()
         close_pool()
 
-    raise SystemExit(1 if FAILURES else 0)
+    raise SystemExit(exit_code())
 
 
 if __name__ == "__main__":

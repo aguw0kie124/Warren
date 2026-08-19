@@ -14,8 +14,14 @@ being applied.
 
 import argparse
 import logging
+import sys
+from pathlib import Path
 
-from app.websearch import FINANCE_DOMAINS, WebSearchError, _allowed, web_search
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _gate import rule  # noqa: E402
+
+from app.websearch import FINANCE_DOMAINS, WebSearchError, _allowed, web_search  # noqa: E402
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 
@@ -24,10 +30,6 @@ DEFAULT_QUERY = "Apple services revenue growth analyst commentary"
 # Deliberately the kind of query that attracts promotional stock content — the
 # reason the allowlist exists at all.
 SPAM_MAGNET_QUERY = "best stocks to buy now for huge gains"
-
-
-def rule(title: str) -> None:
-    print(f"\n{'─' * 70}\n{title}\n{'─' * 70}")
 
 
 def show(results: list, check_allowlist: bool) -> None:

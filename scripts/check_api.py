@@ -73,16 +73,19 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from uuid import uuid4
 
 import httpx
 
-from app import api, finnhub
-from app.config import settings
-from app.db import close_pool
-from app.sec_http import close_client, sec_get
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-FAILURES: list[str] = []
+from _gate import exit_code, indent, note, rule, summary, verdict  # noqa: E402
+
+from app import api, finnhub  # noqa: E402
+from app.config import settings  # noqa: E402
+from app.db import close_pool  # noqa: E402
+from app.sec_http import close_client, sec_get  # noqa: E402
 
 # pid -> uvicorn log path, so a dead server's last words survive it.
 _LOGS: dict[int, str] = {}
@@ -109,22 +112,6 @@ BURST_QUESTION = (
     "Compare how {a} and {b} describe competition risk in their most recent 10-K."
 )
 BURST_TICKERS = {"Apple": "AAPL", "Microsoft": "MSFT", "Meta": "META", "Tesla": "TSLA"}
-
-
-def rule(title: str) -> None:
-    print(f"\n{'━' * 78}\n{title}\n{'━' * 78}")
-
-
-def verdict(ok: bool, label: str) -> bool:
-    """Record one check."""
-    print(f"  [{'ok ' if ok else 'BAD'}] {label}")
-    if not ok:
-        FAILURES.append(label)
-    return ok
-
-
-def indent(text: str, prefix: str = "    │ ") -> str:
-    return "\n".join(prefix + line for line in text.splitlines())
 
 
 # ---------------------------------------------------------------------------
@@ -279,11 +266,11 @@ def check_single_query(url: str, quiet: bool) -> dict:
         return {}
     body = show(response, quiet)
 
-    # The contract is three fields. `answer()` returns four, and the fourth is a
-    # list of LangChain message objects — enormous, and not something a client
-    # should ever have to ignore.
-    verdict(set(body) == {"answer", "citations", "thread_id"},
-            f"body is exactly answer/citations/thread_id (got {sorted(body)})")
+    # The contract is answer/citations/thread_id/route. `answer()` returns a
+    # fifth field too, the full message list — enormous, and not something a
+    # client should ever have to ignore.
+    verdict(set(body) == {"answer", "citations", "thread_id", "route"},
+            f"body is exactly answer/citations/thread_id/route (got {sorted(body)})")
     verdict(len(body.get("answer", "")) > 200, "the answer is substantive, not a stub")
     verdict(body.get("thread_id"), "a thread_id came back, unasked")
     verdict(any(c["type"] == "filing" for c in body.get("citations", [])),
@@ -506,8 +493,8 @@ def check_cold_burst(concurrency: int, quiet: bool) -> None:
             verdict("Retry-After" in overflow_response.headers,
                     "and carries Retry-After, so the client knows what to do")
         else:
-            print(f"  [-- ] cap not exercised: {concurrency} < "
-                  f"MAX_CONCURRENT_RUNS={api.MAX_CONCURRENT_RUNS}")
+            note(f"cap not exercised: {concurrency} < "
+                 f"MAX_CONCURRENT_RUNS={api.MAX_CONCURRENT_RUNS}")
 
         if not quiet:
             print("\n    ↳ the human reading: does each answer discuss only its own two "
@@ -580,17 +567,13 @@ def main() -> None:
         if not args.skip_burst and not args.server:
             check_cold_burst(args.burst, args.quiet)
 
-        rule("summary")
-        if FAILURES:
-            print(f"  {len(FAILURES)} check(s) FAILED:")
-            for failure in FAILURES:
-                print(f"    - {failure}")
-            print("\n  Answer-quality and tool-choice failures belong to Module C, not "
-                  "to this layer.\n  Run scripts/check_agent.py before suspecting "
-                  "app/api.py.")
-        else:
-            print("  all checks passed — now read the answers themselves, and confirm "
-                  "the burst\n  answers stayed inside their own two companies.")
+        summary(
+            on_failure="Answer-quality and tool-choice failures belong to Module "
+                       "C, not to this layer.\n  Run scripts/check_agent.py "
+                       "before suspecting app/api.py.",
+            on_success="now read the answers themselves, and confirm the burst "
+                       "answers stayed\n  inside their own two companies.",
+        )
     finally:
         if process is not None:
             stop_server(process)
@@ -598,7 +581,7 @@ def main() -> None:
         close_client()
         close_pool()
 
-    raise SystemExit(1 if FAILURES else 0)
+    raise SystemExit(exit_code())
 
 
 if __name__ == "__main__":

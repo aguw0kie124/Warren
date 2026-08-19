@@ -6,8 +6,14 @@ Stands in for `psql \\dt` / `\\d chunks` so you don't need a host psql client.
 """
 
 import logging
+import sys
+from pathlib import Path
 
-from app.db import close_pool, get_conn, init_schema
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _gate import exit_code, rule, summary, verdict  # noqa: E402
+
+from app.db import close_pool, get_conn, init_schema  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -43,22 +49,36 @@ def main() -> None:
     # idempotent, and this is the cheapest place to prove it.
     init_schema()
 
+    results = {}
     with get_conn() as conn:
         for title, sql in QUERIES.items():
-            print(f"\n=== {title} ===")
-            for row in conn.execute(sql).fetchall():
+            rule(title)
+            rows = conn.execute(sql).fetchall()
+            results[title] = rows
+            for row in rows:
                 # indexdef is long; print it on its own line for readability
                 if title == "indexes":
                     print(f"  {row[0]}.{row[1]}\n      {row[2]}")
                 else:
                     print("  " + " | ".join(str(v) for v in row))
 
-    print("\nA0 checklist:")
-    print("  [ ] 'vector' listed under extensions")
-    print("  [ ] both 'filings' and 'chunks' listed under tables")
-    print("  [ ] chunks.embedding is USER-DEFINED (the vector type)")
-    print("  [ ] chunks.content_tsv shows is_generated = ALWAYS")
-    print("  [ ] chunks_embedding_hnsw_idx uses hnsw, chunks_content_tsv_gin_idx uses gin")
+    rule("A0 checklist")
+    verdict("vector" in {r[0] for r in results["extensions"]},
+            "'vector' listed under extensions")
+    tables = {r[0] for r in results["tables"]}
+    verdict({"filings", "chunks"} <= tables, "both 'filings' and 'chunks' listed under tables")
+    columns = {r[0]: (r[1], r[2]) for r in results["chunks columns"]}
+    verdict(columns.get("embedding", (None,))[0] == "USER-DEFINED",
+            "chunks.embedding is USER-DEFINED (the vector type)")
+    verdict(columns.get("content_tsv", (None, None))[1] == "ALWAYS",
+            "chunks.content_tsv shows is_generated = ALWAYS")
+    index_defs = {r[1]: r[2] for r in results["indexes"]}
+    verdict("hnsw" in index_defs.get("chunks_embedding_hnsw_idx", ""),
+            "chunks_embedding_hnsw_idx uses hnsw")
+    verdict("gin" in index_defs.get("chunks_content_tsv_gin_idx", ""),
+            "chunks_content_tsv_gin_idx uses gin")
+
+    summary()
 
 
 if __name__ == "__main__":
@@ -66,3 +86,5 @@ if __name__ == "__main__":
         main()
     finally:
         close_pool()
+
+    raise SystemExit(exit_code())
