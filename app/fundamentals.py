@@ -189,16 +189,72 @@ class Statement:
 # absence instead.
 
 
-def covered_tickers() -> set[str]:
-    """Tickers with fundamentals — the numeric half of the coverage question.
+# A 10-Q lands roughly every 90 days, so a ticker whose newest fact was filed
+# longer ago than this has almost certainly filed something we do not hold.
+#
+# Derived from `filed_date` rather than from a `fetched_at` column, for the
+# same reason periods are derived from `start`/`end` and never from the
+# payload's own `fy`: a stored timestamp is a second source of truth that can
+# disagree with the facts, and when it does it wins silently.
+REFETCH_AFTER_DAYS = 100
 
-    Deliberately separate from `tools._covered_tickers()`, which answers the
-    *text* half. Under asymmetric coverage the two sets differ by design, and
-    conflating them would let a company with fundamentals but no filings look
-    like a corpus gap, or the reverse.
+
+def ensure_facts(ticker: str) -> bool:
+    """Make sure this ticker's facts are present and not obviously behind SEC.
+
+    **Nothing is backfilled.** One `companyfacts` request buys a company's
+    entire filing history, so a stored universe would only ever be a subset of
+    what is freely available — and gating on it reports "no coverage" for a
+    company one free call would answer. What is already in `company_facts` is
+    kept as a warm start; anything else is fetched the first time it is asked
+    for and written back.
+
+    Returns False when SEC genuinely has nothing: a filer with no XBRL, or a
+    successor-CIK case like XOM (see the note above). **Never raises** — a
+    fetch failure returns False so `get_financials` reports an absence rather
+    than surfacing a traceback, per the tool-failures-are-text rule.
+
+    Re-fetching is safe and needs no reconciliation: `store.upsert_facts`
+    supersedes only on a later `filed_date`, so a restatement wins and an
+    unchanged filing writes nothing.
     """
+    # Imported here rather than at module scope: `app.tickers` and `app.xbrl`
+    # both reach the network layer, and `app.store` imports `app.xbrl` for the
+    # Fact type. Keeping them local preserves this module's property of being
+    # importable, and unit-testable, without any of that being reachable.
+    from app.store import upsert_facts
+    from app.tickers import try_resolve_ticker
+    from app.xbrl import fetch_company_facts, parse_facts
+
+    ticker = ticker.upper()
     with get_conn() as conn:
-        return {r[0] for r in conn.execute("SELECT DISTINCT ticker FROM company_facts")}
+        newest = conn.execute(
+            "SELECT max(filed_date) FROM company_facts WHERE ticker = %s",
+            (ticker,),
+        ).fetchone()[0]
+
+    if newest is not None and (date.today() - newest).days < REFETCH_AFTER_DAYS:
+        return True
+
+    # A ticker that genuinely stopped filing — delisted, acquired — re-fetches
+    # on every call, because max(filed_date) never advances again. One SEC
+    # request, and rare; a negative marker row would fix it and is not worth
+    # building on speculation.
+    try:
+        company = try_resolve_ticker(ticker)
+        if company is None:
+            return newest is not None
+        facts = parse_facts(fetch_company_facts(company.cik), ticker)
+        if facts:
+            with get_conn() as conn:
+                upsert_facts(conn, facts)
+            logger.info("fetched %d fact(s) for %s on demand", len(facts), ticker)
+    except Exception as exc:  # noqa: BLE001 - reported as an absence, not raised
+        logger.warning("companyfacts fetch failed for %s: %s", ticker, exc)
+        # Stale beats nothing: if rows are already held, serve them.
+        return newest is not None
+
+    return newest is not None or bool(facts)
 
 
 def _period_ends(conn, ticker: str, period: str, limit: int) -> list[date]:
@@ -294,6 +350,7 @@ def load_statement(
     turn.
     """
     ticker = ticker.upper()
+    ensure_facts(ticker)
     lines = STATEMENTS[statement]
     limit = max(1, min(limit, MAX_PERIODS))
     concepts = [c for _, candidates in lines for c in candidates]
@@ -353,6 +410,7 @@ def load_concept(
     shape, the citations and the period labelling are identical.
     """
     ticker = ticker.upper()
+    ensure_facts(ticker)
     with get_conn() as conn:
         periods = _period_ends(conn, ticker, period, max(1, min(limit, MAX_PERIODS)))
         if not periods:

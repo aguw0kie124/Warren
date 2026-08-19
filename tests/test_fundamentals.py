@@ -15,7 +15,7 @@ producing a *plausible* statement rather than an error:
   as a company that earned nothing.
 """
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
@@ -164,3 +164,142 @@ def test_mixed_is_true_only_when_more_than_one_tag_contributed():
     assert not StatementRow("x", ("A",), "USD", {}).mixed
     assert StatementRow("x", ("A", "B"), "USD", {}).mixed
     assert not StatementRow("x", (), None, {}).mixed
+
+
+# --- fetching on demand -----------------------------------------------------
+#
+# `ensure_facts` is what replaced the backfill: nothing is pre-loaded, so a
+# ticker is fetched the first time it is asked for and written back. Every
+# failure mode here is silent by nature — a fetch that should have happened and
+# didn't looks exactly like a company with no data, and a fetch that happens on
+# every call just makes the tool slow. Both need pinning.
+#
+# Offline like the rest of the file: `get_conn` is faked, and the three
+# functions `ensure_facts` imports lazily are patched at their source modules,
+# which is where a function-local import resolves them.
+
+
+class _FakeConn:
+    def __init__(self, newest, calls):
+        self._newest, self._calls = newest, calls
+
+    def execute(self, sql, params=None):
+        self._calls.append(sql)
+        return self
+
+    def fetchone(self):
+        return (self._newest,)
+
+
+def _patch_db(monkeypatch, newest):
+    """Pretend company_facts holds one ticker whose newest fact was filed then."""
+    import contextlib
+
+    calls: list[str] = []
+
+    @contextlib.contextmanager
+    def fake_get_conn():
+        yield _FakeConn(newest, calls)
+
+    monkeypatch.setattr("app.fundamentals.get_conn", fake_get_conn)
+    return calls
+
+
+def _patch_sec(monkeypatch, fetched, *, raises=None, resolves=True):
+    """Count SEC fetches and capture what got written."""
+    import types
+
+    state = {"fetches": 0, "written": []}
+
+    def fake_fetch(cik):
+        state["fetches"] += 1
+        if raises is not None:
+            raise raises
+        return {"cik": cik}
+
+    monkeypatch.setattr("app.xbrl.fetch_company_facts", fake_fetch)
+    monkeypatch.setattr("app.xbrl.parse_facts", lambda payload, ticker: list(fetched))
+    monkeypatch.setattr(
+        "app.tickers.try_resolve_ticker",
+        lambda t: types.SimpleNamespace(cik="0000320193") if resolves else None,
+    )
+    monkeypatch.setattr(
+        "app.store.upsert_facts",
+        lambda conn, facts: state["written"].extend(facts) or len(facts),
+    )
+    return state
+
+
+def test_a_ticker_with_no_stored_facts_is_fetched_and_written(monkeypatch):
+    from app.fundamentals import ensure_facts
+
+    _patch_db(monkeypatch, newest=None)
+    state = _patch_sec(monkeypatch, fetched=["f1", "f2"])
+
+    assert ensure_facts("NVDA") is True
+    assert state["fetches"] == 1
+    assert state["written"] == ["f1", "f2"]
+
+
+def test_recently_filed_facts_are_served_without_touching_sec(monkeypatch):
+    """The warm-start half. Without this the tool re-downloads ~3.8 MB per call."""
+    from app.fundamentals import ensure_facts
+
+    _patch_db(monkeypatch, newest=date.today() - timedelta(days=10))
+    state = _patch_sec(monkeypatch, fetched=["f1"])
+
+    assert ensure_facts("AAPL") is True
+    assert state["fetches"] == 0
+
+
+def test_stale_facts_are_refetched(monkeypatch):
+    """A company filed a 10-Q since the rows were written. Serving what we hold
+    would answer a question about *last year* as though it were current."""
+    from app.fundamentals import REFETCH_AFTER_DAYS, ensure_facts
+
+    _patch_db(monkeypatch, newest=date.today() - timedelta(days=REFETCH_AFTER_DAYS + 1))
+    state = _patch_sec(monkeypatch, fetched=["f1"])
+
+    assert ensure_facts("AAPL") is True
+    assert state["fetches"] == 1
+
+
+def test_a_filer_sec_has_nothing_for_reports_absence(monkeypatch):
+    from app.fundamentals import ensure_facts
+
+    _patch_db(monkeypatch, newest=None)
+    _patch_sec(monkeypatch, fetched=[])
+
+    assert ensure_facts("ZZZZ") is False
+
+
+def test_an_unresolvable_ticker_reports_absence(monkeypatch):
+    from app.fundamentals import ensure_facts
+
+    _patch_db(monkeypatch, newest=None)
+    state = _patch_sec(monkeypatch, fetched=["f1"], resolves=False)
+
+    assert ensure_facts("ZZZZ") is False
+    assert state["fetches"] == 0
+
+
+def test_a_failed_fetch_returns_false_rather_than_raising(monkeypatch):
+    """Tool failures are returned as text, so this must not propagate — an
+    exception here would surface a traceback where an absence belongs."""
+    from app.fundamentals import ensure_facts
+
+    _patch_db(monkeypatch, newest=None)
+    _patch_sec(monkeypatch, fetched=["f1"], raises=RuntimeError("SEC 503"))
+
+    assert ensure_facts("AAPL") is False
+
+
+def test_a_failed_refetch_still_serves_what_is_already_stored(monkeypatch):
+    """Stale beats nothing. SEC being down must not turn a company we have
+    years of history for into a corpus gap."""
+    from app.fundamentals import ensure_facts
+
+    _patch_db(monkeypatch, newest=date(2020, 1, 1))
+    _patch_sec(monkeypatch, fetched=["f1"], raises=RuntimeError("SEC 503"))
+
+    assert ensure_facts("AAPL") is True

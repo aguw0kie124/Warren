@@ -92,9 +92,10 @@ Remove `Quote`, `get_quote`, `BasicFinancials`, `get_basic_financials`, `_pick`,
 
 ## Step 2 — S&P 500 coverage and on-demand text ingestion
 
-**`data/sp500.txt` is static and committed**, generated once from the Wikipedia constituents list with the date recorded in a header comment. Membership changes ~20 times a year; a runtime scrape would be a new failure path for no benefit. It replaces `data/universe_500.txt`, whose ordering problem (SEC's `company_tickers.json` is only partly size-ordered — Exxon at index 7424) is exactly what a real index list avoids.
+**Nothing is backfilled for fundamentals, and `scripts/backfill_facts.py` is gone.** One `companyfacts` call buys a company's whole financial history, so a stored universe was only ever a subset of what is free — and `app/tools.py` gated the tool on it, reporting "no coverage" for a company one call would answer. `fundamentals.ensure_facts()` now serves what is held, fetches on a miss and writes back; the ~387 companies already in `company_facts` stay as a warm start. `data/universe_500.txt` and `store.existing_fact_ciks` went with the script.
 
-- **Facts:** re-run `scripts/backfill_facts.py --tickers-file data/sp500.txt`. Free, resumable, ~30 min.
+**`data/sp500.txt` is static and committed**, generated once from the Wikipedia constituents list with the date recorded in a header comment. Membership changes ~20 times a year; a runtime scrape would be a new failure path for no benefit. It now drives the **text** backfill only.
+
 - **Text:** `scripts/ingest.py` gains `--tickers-file` and **per-ticker error isolation** — today the loop at [scripts/ingest.py:90](scripts/ingest.py#L90) has no `try/except`, so one `UnknownTickerError` aborts the batch. Backfill ~25 tickers (~25s per filing).
 - **The asymmetry is the design and must stay legible.** One HTTP call buys a company's whole financial history; text costs ~25s of parse-and-embed per filing. A company can have full fundamentals and still report a corpus gap for its risk factors.
 
@@ -169,7 +170,7 @@ The gate prints recall@k and MRR for each configuration side by side, and **fail
 
 The ticker page (profile, chart, statement tables, peers) and its REST endpoints; SSE streaming; the React UI; 8-K and earnings surprises; 10-K Item 8 and the notes.
 
-The seams are left open: `company_facts` is queried by ticker and period so a REST endpoint over it is a thin SELECT; `sic`/`sicDescription` arrive free in the submissions payload [app/edgar.py:162](app/edgar.py#L162) already fetches, so peers is one parse function away; and Step 2's ingest notice goes through `get_stream_writer()` so streaming picks it up for free.
+The seams are left open: `company_facts` is queried by ticker and period so a REST endpoint over it is a thin SELECT (behind `ensure_facts`, so it would cover any filer rather than the stored ones); `sic`/`sicDescription` arrive free in the submissions payload [app/edgar.py:162](app/edgar.py#L162) already fetches, so peers is one parse function away; and Step 2's ingest notice goes through `get_stream_writer()` so streaming picks it up for free.
 
 ---
 
@@ -181,7 +182,6 @@ The seams are left open: `company_facts` is queried by ticker and period so a RE
 |---|---|---|
 | 0 | every `scripts/check_*.py` still exits 0 | some do — confirmed clean 2026-08-19 |
 | 1 | `scripts/check_prices.py` | no |
-| 2 | `scripts/backfill_facts.py --tickers-file data/sp500.txt` (~30 min) | no |
 | 2 | `scripts/ingest.py --tickers-file data/sp500.txt --limit 2` (~25 min) | no |
 | 2 | `scripts/check_data.py` | partly |
 | 2 | `scripts/check_agent.py` + `scripts/check_router.py` — the 7-tool regression | **yes** |

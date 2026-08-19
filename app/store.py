@@ -72,11 +72,6 @@ WHERE EXCLUDED.filed_date > company_facts.filed_date
 """
 
 
-def existing_fact_ciks(conn: Connection) -> set[str]:
-    """Which filers already have facts — what makes a backfill resumable."""
-    return {row[0] for row in conn.execute("SELECT DISTINCT cik FROM company_facts")}
-
-
 def upsert_facts(conn: Connection, facts: Sequence[Fact]) -> int:
     """Write XBRL facts. Returns the number offered, not the number changed.
 

@@ -577,22 +577,26 @@ def get_financials(
     company stated. When a question needs both ("is it expensive given how it
     has grown"), call both and say which number came from where.
 
-    Coverage is wider than the filings corpus: a company can have full
-    financial history here while `search_filings` reports a corpus gap for its
-    risk factors. That is expected, not a contradiction — the two cover
-    different things.
+    Coverage is wider than the filings corpus: essentially any US filer has
+    full financial history here, while `search_filings` reports a corpus gap
+    for the same company's risk factors. That is expected, not a
+    contradiction — the two cover different things.
 
     Periods are labelled by their END DATE, not by a fiscal-year number,
     because fiscal years differ between companies and the end date is
     unambiguous. A blank cell means the company did not report that line.
     """
     symbol = ticker.strip().upper()
-    if symbol not in fundamentals.covered_tickers():
+    # Fetches from SEC on a miss, so this is a real answer about the company
+    # rather than about what happens to be stored. False means SEC itself has
+    # nothing.
+    if not fundamentals.ensure_facts(symbol):
         return _fail(
-            f"NO FUNDAMENTALS: {symbol} has no XBRL financial data stored. It may "
-            f"be a foreign private issuer (which files 20-F rather than 10-K), a "
-            f"recent listing, or simply not in the backfilled universe. Say so "
-            f"rather than estimating the numbers."
+            f"NO FUNDAMENTALS: SEC publishes no XBRL financial data for {symbol}. "
+            f"It may be a foreign private issuer (which files 20-F rather than "
+            f"10-K), a recent listing, or a ticker that names a successor entity "
+            f"holding none of the predecessor's filings. Say so rather than "
+            f"estimating the numbers."
         )
 
     if period not in fundamentals.VALID_PERIODS:
@@ -618,8 +622,9 @@ def get_financials(
 
     if not result.periods:
         return _fail(
-            f"No {period} periods are stored for {symbol}, so no statement can be "
-            f"built."
+            f"SEC holds no completed {period} periods for {symbol}, so no "
+            f"statement can be built. A ticker can name a successor entity that "
+            f"holds none of the predecessor's filing history."
         )
 
     # One citation per filing that reported these periods. Built from the

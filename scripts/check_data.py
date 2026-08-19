@@ -29,6 +29,7 @@ companies that are fine and train whoever runs this to ignore it.
 
 import argparse
 import logging
+import time
 import sys
 from pathlib import Path
 
@@ -38,7 +39,7 @@ from _gate import exit_code, indent, note, rule, summary, verdict  # noqa: E402
 
 from app.db import close_pool, get_conn  # noqa: E402
 from app.edgar import filing_index_url  # noqa: E402
-from app.fundamentals import STATEMENTS, covered_tickers, load_statement  # noqa: E402
+from app.fundamentals import STATEMENTS, load_statement  # noqa: E402
 from app.sec_http import close_client, sec_get  # noqa: E402
 from app.tools import get_financials  # noqa: E402
 
@@ -59,6 +60,11 @@ UNIVERSAL = {
 # Ordinary operating companies across four sectors, so a mapping that only
 # works for large-cap tech fails here rather than in an answer.
 MAPPING_SAMPLE = ("AAPL", "NVDA", "WMT", "JNJ", "CVX", "XOM")
+
+# Deliberately outside MAPPING_SAMPLE: section 7 deletes this ticker's rows
+# and watches them come back, which would be circular against a name the
+# earlier sections depend on.
+ON_DEMAND_TICKER = "RIVN"
 
 
 def query(sql, params=()):
@@ -163,11 +169,9 @@ def check_agreement() -> None:
 def check_statements(quiet: bool) -> None:
     rule("4. the statement mapping")
 
-    covered = covered_tickers()
+    # No coverage check: load_statement calls ensure_facts, so a ticker that
+    # was never backfilled is fetched here rather than skipped.
     for ticker in MAPPING_SAMPLE:
-        if ticker not in covered:
-            note(f"{ticker} has no fundamentals — skipped")
-            continue
         for name in STATEMENTS:
             statement = load_statement(ticker, name, "annual", limit=4)
             resolved = statement.resolved
@@ -249,6 +253,46 @@ def check_tool(quiet: bool) -> None:
     )
 
 
+def check_on_demand() -> None:
+    """The fetch-through path — nothing is backfilled, so this is coverage.
+
+    Destructive on purpose: it deletes one ticker's facts and asserts they come
+    back. That is only safe *because* of the property being tested — the rows
+    are reconstructible from one free SEC call — and a non-destructive version
+    would pass on the first run and be meaningless on every one after.
+    """
+    rule("7. facts are fetched on demand, not backfilled")
+
+    before = query("SELECT count(*) FROM company_facts WHERE ticker = %s",
+                   (ON_DEMAND_TICKER,))[0][0]
+    with get_conn() as conn:
+        conn.execute("DELETE FROM company_facts WHERE ticker = %s",
+                     (ON_DEMAND_TICKER,))
+    note(f"deleted {before:,} stored fact(s) for {ON_DEMAND_TICKER}")
+
+    start = time.perf_counter()
+    text, citations = get_financials.func(ticker=ON_DEMAND_TICKER,
+                                          statement="income", limit=3)
+    cold = time.perf_counter() - start
+
+    verdict("Revenue" in text and "NO FUNDAMENTALS" not in text,
+            f"a ticker with nothing stored answers anyway ({cold:.1f}s)")
+    verdict(bool(citations), f"and cites the filings it came from ({len(citations)})")
+
+    written = query("SELECT count(*) FROM company_facts WHERE ticker = %s",
+                    (ON_DEMAND_TICKER,))[0][0]
+    verdict(written > 0, f"the fetch was written back ({written:,} fact(s))")
+
+    start = time.perf_counter()
+    again, _ = get_financials.func(ticker=ON_DEMAND_TICKER,
+                                   statement="income", limit=3)
+    warm = time.perf_counter() - start
+    verdict(again == text, "the second call returns an identical statement")
+    verdict(warm < cold / 2,
+            f"and serves it from Postgres rather than re-fetching "
+            f"({warm:.2f}s vs {cold:.1f}s)")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--statements", action="store_true",
@@ -265,6 +309,7 @@ def main() -> None:
             check_agreement()
             check_statements(args.quiet)
             check_tool(args.quiet)
+            check_on_demand()
 
         summary(
             on_failure="A wrong number is app/xbrl.py (parsing) or "

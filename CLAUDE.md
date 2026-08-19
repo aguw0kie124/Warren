@@ -21,7 +21,7 @@ An AI-driven financial research platform. A user asks a natural-language questio
 
 **Corpus, text:** 4 tickers (AAPL, META, MSFT, TSLA), 13 filings, 806 chunks.
 
-**Corpus, numeric:** 386 companies, 3.6M XBRL facts, ~1.7 GB, fiscal 2009–2026. **Coverage is deliberately asymmetric** — one HTTP call buys a company's whole financial history, against ~25s of parse-and-embed per filing — so a company can have full fundamentals and still report a corpus gap for its risk factors. That is the design, not a contradiction; `fundamentals.covered_tickers()` and `tools._covered_tickers()` answer the two halves separately and must not be conflated.
+**Corpus, numeric:** ~387 companies and 3.8M XBRL facts held, fiscal 2009–2026 — but **nothing is backfilled and the number is not a coverage boundary.** `fundamentals.ensure_facts()` fetches any filer from SEC on first use and writes it back, so what is stored is a warm start, not the universe. **Coverage is still deliberately asymmetric** — one HTTP call buys a company's whole financial history, against ~25s of parse-and-embed per filing — so a company can have full fundamentals and still report a corpus gap for its risk factors. That remains the design; the asymmetry is now a difference in *latency* (~1.5s to fetch facts) rather than in which names are on a list.
 
 **Corpus, text (detail):** Exactly **one 10-K per ticker** — the other nine are 10-Qs — so **no year-over-year comparison of filings is answerable for any covered company**. Write gate questions against what is ingested, not against what the ingestion policy says it collects.
 
@@ -42,9 +42,9 @@ docker compose down          # add -v to also drop the data volume
 # model at startup — expect ~10s before it answers.
 .venv/bin/python -m uvicorn app.api:app --reload
 
-# Ingestion — filing text (slow, ~25s/filing) and fundamentals (one call/company)
+# Ingestion — filing text only (slow, ~25s/filing)
 .venv/bin/python scripts/ingest.py --ticker AAPL
-.venv/bin/python scripts/backfill_facts.py --tickers-file data/universe_500.txt
+# Fundamentals need no ingestion step — get_financials fetches on demand.
 
 # Tests — offline, no DB / keys / model needed
 .venv/bin/python -m pytest
@@ -135,7 +135,14 @@ Five findings, each of which produced a plausible wrong answer before it was fix
 - **Tag fallthrough must be per period, not per line.** NVIDIA reports revenue under `RevenueFromContractWithCustomerExcludingAssessedTax` for one early year and `Revenues` since; "first candidate with any data" rendered four blank revenue years beneath a full gross-profit row. `_resolve_line` fills period by period and records every tag that contributed, so a re-tagged line reassembles. Capital expenditure has the same break at FY2020.
 - **Periods must be bounded by `CURRENT_DATE`.** XBRL carries forward-dated *assumptions* — Nucor tags a health-care trend rate over 2027 in a 2011 filing — and without the bound that was Nucor's most recent "annual period", rendering a blank 2027 column and dropping a real year.
 - **A ticker names the current registrant, not the whole history.** SEC maps XOM to CIK 2115436 "ExxonMobil Holdings Corp", a successor entity, not CIK 34088 which holds decades of Exxon filings. 3 of 386 companies are in this position (XOM, HONA, CBRS). Nothing follows the chain — SEC publishes no predecessor link, and guessing by name would attribute one company's numbers to another. The tool reports the absence.
-- **`company_tickers.json` is only partly size-ordered.** It is ordered by market cap for recent CIKs, but companies registered long ago fall into a block near index 7100+: Exxon (CIK 34088) at 7424, JPMorgan at 7147, McDonald's at 7177, while Chevron sits at 31. A top-N slice silently misses mega-caps *by age of registration* — 22 of 128 well-known large caps were absent. `data/universe_500.txt` carries an explicit supplement for that reason.
+- **`company_tickers.json` is only partly size-ordered.** It is ordered by market cap for recent CIKs, but companies registered long ago fall into a block near index 7100+: Exxon (CIK 34088) at 7424, JPMorgan at 7147, McDonald's at 7177, while Chevron sits at 31. A top-N slice silently misses mega-caps *by age of registration* — 22 of 128 well-known large caps were absent. Nothing depends on this any more (fundamentals are fetched on demand, so there is no universe file to slice), but it stays recorded: any future code that builds a ticker list from that file has the same trap waiting.
+
+**Nothing is backfilled — `ensure_facts` fetches through.** One `companyfacts` call buys a company's entire filing history, so any stored universe is by definition a subset of what is free, and gating on it reports "no coverage" for a company one call would answer. `ensure_facts()` serves what is held, fetches on a miss, and writes back. Two consequences:
+
+- **Staleness is derived from `max(filed_date)`, not from a `fetched_at` column.** A 10-Q lands every ~90 days, so `REFETCH_AFTER_DAYS = 100`. Same reasoning as periods coming from `start`/`end` rather than `fy`: a stored timestamp is a second source of truth that can disagree with the facts, and when it does it wins silently.
+- **A re-fetch needs no reconciliation.** `store.upsert_facts` supersedes only on a later `filed_date`, so a restatement wins and an unchanged filing writes nothing. That is what makes fetch-through safe with no delete-first and no dirty-tracking.
+
+Accepted cost: a ticker that genuinely stopped filing (delisted, acquired) re-fetches on every call, because `max(filed_date)` never advances again. One SEC request, rare; a negative-marker row would fix it and isn't worth building on speculation.
 
 Two more rules worth keeping:
 
@@ -210,7 +217,7 @@ Full design, gates, and rationale in [docs/phase-2-plan.md](docs/phase-2-plan.md
 
 - **Step 0 — Tidy. Done, 2026-08-19.** All thirteen `check_*.py` gates now share `scripts/_gate.py`'s `rule` / `verdict` / `note` / `indent` / `summary` / `exit_code` primitives; none carries its own copy any more. The migration surfaced and fixed two gates stale since they'd last been touched (`check_tools.py`'s tool count, `check_api.py`'s response contract — both missing the fields F1/F2 and E1 had since added) and several gates that never actually set a failing exit code (`check_tickers`, `check_edgar`, `check_parser`, `check_chunker`, `check_retriever`, `check_db`) — a real bug, fixed as a side effect of the migration rather than as its own task.
 - **Step 1 — Market data moves to yfinance.** `app/prices.py` replaces Finnhub for quotes and ratios; Finnhub keeps only `get_company_news`. No `prices` table — everything is a live call, normalised to project dataclasses. **Accepted tradeoff:** yfinance is an unofficial scraper, so a Yahoo breakage now takes out all market data at once; the earlier provider split existed specifically to avoid that, and the mitigation is that swapping the provider back out is a one-file change. `get_price_history` returns a summary, never raw bars — there is no chart to feed it to.
-- **Step 2 — S&P 500 coverage + on-demand ingestion.** `data/sp500.txt` (static, committed, dated) replaces `data/universe_500.txt`. Facts backfill is free and total; text backfill stays ~25 tickers, with the rest reached through on-demand ingestion off the corpus-gap branch in `app/tools.py` — one ingest per turn, outcomes (including parser failures) cached in an `ingest_attempts` table so a bad filer isn't retried every turn for 7 days.
+- **Step 2 — S&P 500 text coverage + on-demand ingestion.** `data/sp500.txt` (static, committed, dated) lists the tickers for the **text** backfill only — ~25 ingested up front, with the rest reached through on-demand ingestion off the corpus-gap branch in `app/tools.py`: one ingest per turn, outcomes (including parser failures) cached in an `ingest_attempts` table so a bad filer isn't retried every turn for 7 days. **There is no facts backfill** — `ensure_facts` already covers every filer.
 - **Step 3 — Observability.** A `runs` ledger in Postgres (tokens, cache, dollars, latency, route, tool calls, status), extending the existing `app/cost.py` rather than replacing it. Recording must never fail a run — wrapped in `try/except Exception` and logged.
 - **Step 4 — Retrieval evals.** A ~30-query golden set seeded from `data/retrieval_a7.json` (hand-confirmed, not taken as ground truth as-is), scored on recall@k and MRR with no LLM judge. Cross-encoder reranking, `k`/`CANDIDATES` tuning, and per-query-type RRF weighting are then measured against that baseline rather than adopted on faith.
 
