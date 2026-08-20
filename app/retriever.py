@@ -17,6 +17,7 @@ from pgvector import Vector
 
 from app.db import get_conn
 from app.embeddings import embed_query
+from app.tracing import retriever_documents, traceable
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +149,7 @@ def rrf_score(dense_rank: int | None, sparse_rank: int | None, k: int = RRF_K) -
     return dense + sparse
 
 
+@traceable(run_type="retriever", name="dense_search", process_outputs=retriever_documents)
 def search(
     query: str,
     ticker: str | None = None,
@@ -181,6 +183,14 @@ def search(
     return _to_results(rows)
 
 
+# The span that matters most in this system. `search_filings` reports one tool
+# call with a query string and a block of prose; everything that decides whether
+# the answer is any good — which filters were applied, which chunks came back,
+# in what order, and whether dense or BM25 found each one — happens in here and
+# is otherwise unrecoverable after the fact. It is also the span P2·2's recall@k
+# and MRR are computed over, so a production trace and an eval row now describe
+# the same object in the same terms.
+@traceable(run_type="retriever", name="hybrid_search", process_outputs=retriever_documents)
 def hybrid_search(
     query: str,
     ticker: str | None = None,

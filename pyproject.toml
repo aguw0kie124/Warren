@@ -63,6 +63,12 @@ dependencies = [
     # about what it exports. It is also what carries LangSmith tracing, which
     # langchain reads straight from the environment.
     "langsmith>=0.11",
+    # Arrives under pydantic-settings, and declared for a sharper reason than
+    # usual: app/config.py calls `load_dotenv` by name so that `.env` reaches
+    # `os.environ`, which is the only place LangSmith tracing looks. If
+    # pydantic-settings ever drops it, tracing stops silently rather than
+    # failing loudly — the exact outcome that call site exists to prevent.
+    "python-dotenv>=1.0",
 
     # No httpx entry here on purpose — it is already declared above for the
     # EDGAR client, and it is what both fastapi's TestClient and check_api.py

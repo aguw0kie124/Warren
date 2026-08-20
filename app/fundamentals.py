@@ -41,6 +41,7 @@ from datetime import date
 from decimal import Decimal
 
 from app.db import get_conn
+from app.tracing import traceable
 
 logger = logging.getLogger(__name__)
 
@@ -199,6 +200,14 @@ class Statement:
 REFETCH_AFTER_DAYS = 100
 
 
+# Traced because the returned bool hides the only thing an operator wants to
+# know here: whether this call served from `company_facts` or went to SEC. The
+# two differ by ~1.5s, and CLAUDE.md records that latency gap as the *entire*
+# remaining shape of the asymmetric-coverage design — fundamentals cover any
+# filer, they just cost a round trip the first time. Under a tool span it is
+# indistinguishable from a slow query. The span makes warm and cold separable,
+# which is what turns "get_financials feels slow sometimes" into a fact.
+@traceable(name="ensure_facts")
 def ensure_facts(ticker: str) -> bool:
     """Make sure this ticker's facts are present and not obviously behind SEC.
 

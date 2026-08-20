@@ -11,6 +11,7 @@ import threading
 from collections.abc import Sequence
 
 from app.config import settings
+from app.tracing import hide_embedding_io, hide_vectors, traceable
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,12 @@ def _build_model():
     return model
 
 
+@traceable(
+    run_type="embedding",
+    name="embed_documents",
+    process_inputs=hide_embedding_io,
+    process_outputs=hide_vectors,
+)
 def embed_documents(texts: Sequence[str], batch_size: int = 16) -> list[Vector]:
     """Embed passages for storage."""
     if not texts:
@@ -87,6 +94,12 @@ def embed_documents(texts: Sequence[str], batch_size: int = 16) -> list[Vector]:
     return [v.tolist() for v in vectors]
 
 
+# The query text is kept in the span and the 768-float result is not. Which
+# template a query was embedded under is invisible from the outside and
+# swapping them degrades retrieval *silently* (see the module docstring), so
+# having the exact string that reached `encode_query` recorded next to what came
+# back is the only external evidence the right one was used.
+@traceable(run_type="embedding", name="embed_query", process_outputs=hide_vectors)
 def embed_query(text: str) -> Vector:
     """Embed a search query."""
     model = get_model()
