@@ -914,3 +914,110 @@ def test_state_is_messages_citations_and_route():
     argue for itself the same way.
     """
     assert set(AgentState.__annotations__) == {"messages", "citations", "route"}
+
+
+# --- stream_answer ------------------------------------------------------------
+#
+# The streaming form runs the same graph as `answer()`, so what is worth testing
+# is only the translation: which events come out, and the one piece of state the
+# translation keeps. That piece is the answer buffer.
+#
+# An `agent` turn that ends in tool calls may stream prose first. It is a
+# preamble, not the answer, and whether a turn was preamble is only knowable
+# once the turn has finished — so the tokens go out live and a `reset` follows.
+# A client that ignored `reset` would show "Let me check the filings." glued to
+# the front of every answer, which is wrong in a way that still reads as
+# plausible prose. Nothing else would catch that.
+
+
+@pytest.fixture
+def streaming_graph(monkeypatch):
+    """`stream_answer` against an in-memory checkpoint instead of Postgres."""
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    graph = agent.build_graph(router=False, checkpointer=InMemorySaver())
+    monkeypatch.setattr(agent, "get_graph", lambda: graph)
+    return graph
+
+
+def events(question: str = "What are Apple's risks?", thread: str = "s1") -> list[dict]:
+    return list(agent.stream_answer(question, thread_id=thread))
+
+
+def test_a_preamble_before_a_tool_call_is_reset_not_kept(
+    scripted, streaming_graph, stub_search
+):
+    scripted(
+        AIMessage(
+            "Let me check the filings.",
+            tool_calls=[tool_call("search_filings", {"query": "risks", "ticker": "AAPL"})],
+        ),
+        AIMessage("Apple flags supplier concentration."),
+    )
+    stream = events()
+    kinds = [e["type"] for e in stream]
+
+    # The preamble streamed, then was withdrawn, and only then did the answer
+    # start — so a client replaying these events in order lands on the answer
+    # alone.
+    assert kinds.index("reset") > kinds.index("token")
+    after_reset = [e for e in stream[kinds.index("reset"):] if e["type"] == "token"]
+    assert "".join(e["text"] for e in after_reset) == "Apple flags supplier concentration."
+
+
+def test_the_stream_ends_with_the_answer_invoke_would_have_given(
+    scripted, streaming_graph, stub_search
+):
+    """`done` is read back off the checkpoint, not accumulated from tokens, so a
+    client that dropped a frame still ends up with the real answer."""
+    scripted(
+        AIMessage("", tool_calls=[tool_call("search_filings", {"query": "risks", "ticker": "AAPL"})]),
+        AIMessage("Apple flags supplier concentration."),
+    )
+    done = events()[-1]
+
+    assert done["type"] == "done"
+    assert done["answer"] == "Apple flags supplier concentration."
+    assert done["thread_id"] == "s1"
+    assert [c["type"] for c in done["citations"]] == ["filing"]
+
+
+def test_each_tool_call_is_described_in_prose(scripted, streaming_graph, stub_search):
+    """A progress log naming `search_filings(section=...)` cannot be checked by
+    the person reading it; one naming the company and the section can."""
+    scripted(
+        AIMessage("", tool_calls=[tool_call(
+            "search_filings",
+            {"query": "risks", "ticker": "AAPL", "section": "Item 1A Risk Factors"},
+        )]),
+        AIMessage("Apple flags supplier concentration."),
+    )
+    steps = [e["label"] for e in events() if e["type"] == "step"]
+
+    assert steps == ["Reading AAPL filings — Item 1A Risk Factors"]
+
+
+def test_a_failure_is_yielded_as_an_error_event_not_raised(streaming_graph, monkeypatch):
+    """The caller is an HTTP response that has already sent its status line."""
+    def explode():
+        raise RuntimeError("provider is down")
+
+    monkeypatch.setattr(agent, "get_llm", explode)
+    last = events()[-1]
+
+    assert last["type"] == "error"
+    assert "provider is down" in last["detail"]
+
+
+def test_citations_are_sent_once_each(scripted, streaming_graph, stub_search):
+    """Two searches returning the same passage merge in state, so the second
+    round has nothing new to send — a client appending blindly must not end up
+    showing the source twice."""
+    scripted(
+        AIMessage("", tool_calls=[tool_call("search_filings", {"query": "risks", "ticker": "AAPL"})]),
+        AIMessage("", tool_calls=[tool_call("search_filings", {"query": "supply", "ticker": "AAPL"})]),
+        AIMessage("Apple flags supplier concentration."),
+    )
+    sent = [c for e in events() if e["type"] == "sources" for c in e["citations"]]
+
+    assert len(sent) == 1

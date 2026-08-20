@@ -16,10 +16,14 @@ target in `vite.config.ts`, not in the app.
 
 | Call | Used for |
 |---|---|
-| `POST /query` | one turn; carries `thread_id` so follow-ups keep context |
+| `POST /query/stream` | every turn — SSE, so the run reports itself as it happens |
 | `GET /threads/{id}` | restoring a session picked from History |
 
-Three things the UI is careful about, because the service is careful about them:
+`POST /query` is the same run without the protocol. Nothing here calls it, but
+`lib/api.ts` keeps `query()` because the blocking form is the easier one to
+reach for from a script or a curl.
+
+Four things the UI is careful about, because the service is careful about them:
 
 - **`route` is rendered, not ignored.** A `research` answer with no citations
   found nothing; `simple` / `advisory` / `clarify` have none by design. The API
@@ -28,6 +32,17 @@ Three things the UI is careful about, because the service is careful about them:
   the sources it added (`App.tsx` diffs against what has already been shown).
 - **`type` is on every source chip** — an audited SEC filing is not a news
   article is not a web page.
+- **`reset` is honoured.** Tokens stream from a model turn before anyone knows
+  whether it was the answer or a preamble to a tool call; when it was a
+  preamble the server withdraws it. Ignoring that event glues *"Let me check
+  the filings."* onto the front of every answer — wrong, and plausible enough
+  that nobody files a bug about it.
+
+Sources render **above** the answer, which is deliberate. During a run they
+also exist first — the agent has read its filings well before it has written a
+sentence — so the evidence is on screen while the answer is still arriving,
+rather than being a footnote to a claim already made. The list collapses past
+four; nothing is dropped, it is one click away.
 
 History is `localStorage` only: the service has no thread index, just
 `GET /threads/{id}`, so the client is the only thing that knows which ids are

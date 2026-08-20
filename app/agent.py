@@ -34,6 +34,7 @@ the conversation that produced it. See `get_checkpointer()` and `answer()`.
 
 import logging
 import threading
+from collections.abc import Iterator
 from typing import Annotated, TypedDict
 from uuid import uuid4
 
@@ -48,6 +49,7 @@ from langchain_core.messages import (
 )
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
@@ -56,7 +58,7 @@ from langgraph.types import RetryPolicy
 from app.config import settings
 from app.db import autocommit_conn, get_pool
 from app.router import RESPOND_PROMPTS, classify
-from app.tools import TOOLS, Citation
+from app.tools import TOOLS, Citation, describe_tool_call
 
 logger = logging.getLogger(__name__)
 
@@ -90,16 +92,27 @@ Choosing tools:
 
 - One specific company's recent headlines → `get_company_news`.
 - Anything not scoped to a single ticker — analyst views, competitors, industry or macro context → `web_search`.
-- What the company officially disclosed → `search_filings`.
-- Current price → `get_quote`. Valuation ratios and margins → `get_basic_financials`.
+- What the company officially disclosed, in its own words → `search_filings`.
+- What the company reported as numbers, and how they moved over time — revenue, margins, earnings, debt, cash flow → `get_financials`.
+- Current price → `get_quote`. Market-computed valuation ratios → `get_basic_financials`.
 
 Call tools in parallel when the question has independent parts, and call the same tool more than once when a comparison needs it (for example one `search_filings` per fiscal year). If a tool reports a failure, tell the reader what was unavailable rather than working around it silently.
+
+**Call the fewest tools that answer the question.** Every result you pull becomes a source listed under your answer, so a question answered from two well-chosen calls is better evidenced than the same question answered from six. Do not sweep every tool for a company just because the question named one.
 
 What this system cannot do:
 
 - **There is no price history**: nothing can answer "how has the stock moved since the 10-K". Say that plainly if asked.
 
-Write for someone who reads financial documents. Be specific and quantitative where the sources are, brief where they are not, and never pad an answer to look thorough."""
+How to write the answer:
+
+- **Lead with the answer.** The first two or three sentences answer the question directly. No preamble, no restating the question, no narrating which tools you called.
+- **Then the detail, in short bullets.** Use a markdown table whenever you are showing one measure across several periods or companies — a period-over-period comparison written as prose is unreadable.
+- Use `##` headings only when the answer genuinely has three or more distinct parts. Most answers need none.
+- **Length follows the question.** A one-line question gets a few sentences. A comparison across years gets a table and a paragraph. Never pad to look thorough, and never add a section that contributes only structure.
+- Keep units and periods attached to every figure — $124.3B, 46.2%, FY2025 — and write them the way the filing does.
+
+Write for someone who reads financial documents: specific and quantitative where the sources are, brief where they are not."""
 
 # C3 · One cache breakpoint, on the system block.
 #
@@ -728,6 +741,167 @@ def answer(
         # writes it, and that shape is a supported one.
         "route": state.get("route") or "research",
     }
+
+
+# ---------------------------------------------------------------------------
+# The streaming form of the same run
+# ---------------------------------------------------------------------------
+#
+# `answer()` returns after 20-60 seconds of silence. That silence is the single
+# worst thing about using this service: a spinner cannot distinguish "reading a
+# 10-K" from "hung", and the elapsed-seconds counter the UI shows is an honest
+# signal that something is happening but not a signal about *what*.
+#
+# **This adds no capability and changes no graph.** It is the same compiled
+# graph, the same nodes and the same checkpoint — `.stream()` instead of
+# `.invoke()`, with the events LangGraph already emits translated into a small
+# vocabulary a UI can render. `answer()` stays exactly as it was, because the
+# gates and `POST /query` depend on it and a streaming rewrite of a working
+# path would be a change with no test to justify it.
+#
+# Two decisions worth keeping:
+#
+# **The answer buffer is resettable.** Tokens stream from the `agent` node as
+# the model produces them, but an `agent` turn that ends in tool calls may have
+# emitted prose first — a preamble the reader must not see spliced onto the
+# real answer. Whether a turn was preamble is only knowable once the turn
+# finishes, so this emits the tokens live and then a `reset` event when the
+# completed turn turns out to have been a tool call. The client discards its
+# buffer. Buffering until the turn completed would be the alternative, and it
+# would throw away exactly the latency this exists to hide.
+#
+# **The terminal values come from the checkpoint, not from the accumulated
+# tokens.** `done` re-reads state and reports `final_text()` and the merged
+# citation list, so a client that dropped a frame still ends up with the same
+# answer `POST /query` would have given it. The token stream is a preview; the
+# checkpoint is the record.
+
+STREAM_MODES = ["updates", "messages"]
+
+
+def _stream_text(chunk) -> str:
+    """The text delta on one streamed message chunk, ignoring tool-call deltas."""
+    content = getattr(chunk, "content", "")
+    if isinstance(content, str):
+        return content
+    return "".join(
+        block.get("text", "")
+        for block in content or []
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+def stream_answer(
+    question: str,
+    thread_id: str | None = None,
+    recursion_limit: int = RECURSION_LIMIT,
+) -> Iterator[dict]:
+    """Run one question, yielding progress events as the graph produces them.
+
+    Same arguments and same conversation semantics as `answer()`. Yields dicts,
+    each with a `type`:
+
+        start   {thread_id}          the id to use for follow-ups
+        route   {route}              E1's dispatch decision
+        step    {label}              one tool call, described in prose
+        sources {citations}          every citation gathered so far, in order
+        token   {text}               a delta of the answer being written
+        reset   {}                   discard buffered tokens; that turn was a
+                                     tool call, not the answer
+        done    {answer, citations, thread_id, route}
+        error   {detail}
+
+    **Failures are yielded, not raised.** By the time the graph runs, the
+    response status line is already sent, so an exception here cannot become an
+    HTTP error — it would surface as a truncated body, which a client reads as
+    a short answer rather than as a failure. The caller re-raises nothing; the
+    `error` event is the report. Genuinely unexpected exceptions are logged
+    with a traceback so a bug still looks like a bug in the log.
+    """
+    thread_id = thread_id or str(uuid4())
+    yield {"type": "start", "thread_id": thread_id}
+
+    # What has already gone out, keyed exactly as `merge_citations` keys it.
+    # A node update carries only what *that* node produced, raw and undeduped —
+    # two searches of one 10-K legitimately return the same passage — so the
+    # stream has to apply the same rule the reducer applies to state. Get this
+    # wrong and the client's list disagrees with `done`'s: sources appear
+    # during the run and then silently change count when it ends.
+    sent: set[tuple[str, str, str]] = set()
+    # Tracked here rather than read back off the checkpoint, because a graph
+    # compiled with `router=False` never writes `route` at all and that shape is
+    # supported. Same default `answer()` uses, for the same reason.
+    route = "research"
+
+    try:
+        stream = get_graph().stream(
+            {"messages": [HumanMessage(question)], "citations": [], "route": ""},
+            config=thread_config(thread_id, recursion_limit),
+            stream_mode=STREAM_MODES,
+        )
+
+        for mode, chunk in stream:
+            if mode == "messages":
+                message, metadata = chunk
+                # `router` streams its one-word label and `tools` streams
+                # nothing; only the two nodes that write prose are the answer.
+                if metadata.get("langgraph_node") not in ("agent", "respond"):
+                    continue
+                text = _stream_text(message)
+                if text:
+                    yield {"type": "token", "text": text}
+                continue
+
+            for node, update in (chunk or {}).items():
+                if node == "router":
+                    route = update.get("route") or route
+                    yield {"type": "route", "route": route}
+
+                elif node == "agent":
+                    last = (update.get("messages") or [None])[-1]
+                    calls = getattr(last, "tool_calls", None) or []
+                    for call in calls:
+                        yield {
+                            "type": "step",
+                            "label": describe_tool_call(call["name"], call.get("args")),
+                        }
+                    if calls:
+                        # That turn was a tool call, so any prose streamed with
+                        # it was preamble and is not part of the answer.
+                        yield {"type": "reset"}
+
+                elif node == "tools":
+                    fresh = []
+                    for citation in update.get("citations") or []:
+                        key = (citation.type, citation.label, citation.source_url)
+                        if key not in sent:
+                            sent.add(key)
+                            fresh.append(citation)
+                    if fresh:
+                        yield {
+                            "type": "sources",
+                            "citations": [c.model_dump() for c in fresh],
+                        }
+
+        final = thread_state(thread_id)
+        yield {
+            "type": "done",
+            "answer": final_text(final["messages"]),
+            "citations": [c.model_dump() for c in final.get("citations", [])],
+            "thread_id": thread_id,
+            "route": route,
+        }
+
+    except GraphRecursionError:
+        logger.error("recursion limit exhausted on thread %s", thread_id)
+        yield {
+            "type": "error",
+            "detail": f"the agent exceeded its {RECURSION_LIMIT}-step limit "
+            "without finishing; the question may be too broad",
+        }
+    except Exception as exc:  # noqa: BLE001 — reported, then logged as a bug
+        logger.exception("stream failed on thread %s", thread_id)
+        yield {"type": "error", "detail": f"the run failed: {exc}"}
 
 
 def thread_state(thread_id: str) -> dict:

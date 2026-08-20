@@ -47,7 +47,14 @@ DEFAULT_NEWS_DAYS = 7
 
 # A single ticker can produce hundreds of articles in a week, which would
 # swamp the agent's context for no gain. Newest first, then cut.
-DEFAULT_NEWS_LIMIT = 10
+#
+# **Five, not ten.** Every article returned becomes a citation, and this feed is
+# thick with syndicated aggregator content — so ten articles bought two or three
+# usable headlines and a source list too long to scan, which is the failure the
+# citation design exists to prevent arriving from the other end. The model can
+# still ask for more (up to `tools.MAX_NEWS_LIMIT`) when a question is genuinely
+# about news volume.
+DEFAULT_NEWS_LIMIT = 5
 
 
 class FinnhubError(RuntimeError):

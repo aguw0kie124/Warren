@@ -55,6 +55,14 @@ MAX_K = 12
 # whole article. Cut it — the URL is in the citation if more is wanted.
 MAX_SUMMARY_CHARS = 600
 
+# `limit` is exposed on get_company_news for the same reason `k` is on
+# search_filings, and clamped for the same reason — but the binding cost here
+# is not the context window, it is the **citation list**. Every article becomes
+# a citation, so one unclamped news call can put twenty-odd sources under an
+# answer that leaned on two of them, and a source list nobody can scan is
+# indistinguishable from one that was never checked.
+MAX_NEWS_LIMIT = 10
+
 _STALENESS_NOTE = (
     "Note: filings state the company's position as of their filing date only. "
     "For anything that happened since, use get_company_news or web_search."
@@ -348,7 +356,9 @@ class CompanyNewsArgs(BaseModel):
     )
     limit: int = Field(
         default=finnhub.DEFAULT_NEWS_LIMIT,
-        description="Maximum number of articles, newest first.",
+        description=f"Maximum number of articles, newest first (1-{MAX_NEWS_LIMIT}). "
+        "Leave it unset unless the question is specifically about news volume — "
+        "every article returned becomes a source under the answer.",
     )
 
 
@@ -378,7 +388,10 @@ def get_company_news(
     """
     try:
         articles = finnhub.get_company_news(
-            symbol, from_date=from_date, to_date=to_date, limit=limit
+            symbol,
+            from_date=from_date,
+            to_date=to_date,
+            limit=max(1, min(limit, MAX_NEWS_LIMIT)),
         )
     except finnhub.UnknownSymbolError as exc:
         return _fail(str(exc))
@@ -658,3 +671,62 @@ TOOLS = [
     get_company_news,
     web_search,
 ]
+
+
+# ---------------------------------------------------------------------------
+# Progress labels
+# ---------------------------------------------------------------------------
+#
+# What the streaming endpoint shows a user while the loop runs. It lives here,
+# beside the tools, rather than in app/agent.py or app/api.py, because it is
+# keyed on tool names and argument names — so a new tool and its label are one
+# file apart, not three. `_LABELS` is deliberately not exhaustive-by-assertion:
+# an unmapped tool falls through to its own humanised name, which is worse
+# writing but never a crash and never a blank line in the UI.
+#
+# **These are user-facing prose, not tool names.** "Reading AAPL risk factors"
+# is a sentence someone can check the agent against; `search_filings(symbol=
+# 'AAPL', section='risk_factors')` is an implementation detail leaking into a
+# progress log, and a reader cannot tell whether it was the right call.
+
+def _shorten(text: str, limit: int = 60) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def describe_tool_call(name: str, args: dict | None = None) -> str:
+    """A one-line, human-readable label for one tool call.
+
+    Written for the person watching the answer being built, so it names the
+    company and the thing being fetched rather than the function and its
+    keyword arguments.
+    """
+    args = args or {}
+    symbol = str(args.get("symbol") or args.get("ticker") or "").strip().upper()
+
+    if name == "search_filings":
+        # `section` is already prose — VALID_SECTIONS holds "Item 1A Risk
+        # Factors", not a slug — so it needs no mapping table to stay readable.
+        section = str(args.get("section") or "").strip()
+        query = args.get("query")
+        what = section or (f"“{_shorten(query, 48)}”" if query else "the filings")
+        return f"Reading {symbol or 'SEC'} filings — {what}"
+
+    if name == "get_financials":
+        what = args.get("concept") or f"{args.get('statement') or 'income'} statement"
+        return f"Pulling {symbol} {what}"
+
+    if name == "get_quote":
+        return f"Checking {symbol} price"
+
+    if name == "get_basic_financials":
+        return f"Fetching {symbol} valuation metrics"
+
+    if name == "get_company_news":
+        return f"Scanning {symbol} news"
+
+    if name == "web_search":
+        return f"Searching the web — “{_shorten(args.get('query') or '', 48)}”"
+
+    # An unmapped tool. Readable, if less specific than the six above.
+    return name.replace("_", " ").capitalize()

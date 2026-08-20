@@ -139,13 +139,24 @@ BENCHMARK = [
 
 # C3 · The prefix length below which Anthropic ignores a cache breakpoint.
 #
-# **Measured on 2026-08-18, not read from the docs**, which give 2048 for the
-# Haiku family. `claude-haiku-4-5-20251001` did not cache a 4,007-token prefix
-# and did cache a 4,569-token one — a 4096 floor, double the published figure.
+# **Measured, not read from the docs**, which give 2048 for the Haiku family.
+# `claude-haiku-4-5-20251001` did not cache a 4,007-token prefix (2026-08-18)
+# and did cache a 4,569-token one. That bracket was originally read as a 4096
+# floor — a round number picked from inside it rather than measured.
+#
+# **2026-08-20 disproved that**: a 4,118-token prompt did not cache either, so
+# the floor is somewhere in (4118, 4569] and 4096 was simply wrong. This
+# constant is now the smallest prefix *observed* to cache rather than a guess
+# at the boundary, because of how it is used — a prompt above it that does not
+# cache is failed as a bug, so a value below the true floor fails the gate for
+# a prompt the provider was always going to ignore. Erring high costs only a
+# missed detection in the unmeasured band; erring low costs a red gate with no
+# bug behind it, which is what happened.
+#
 # Nothing is raised either way: an ignored breakpoint returns an ordinary
 # response with zeroes in the cache columns, which is exactly what the numbers
 # below exist to make visible.
-CACHE_MINIMUM_TOKENS = 4096 if "haiku" in settings.anthropic_model else 1024
+CACHE_MINIMUM_TOKENS = 4569 if "haiku" in settings.anthropic_model else 1024
 
 # C4a · The question the context guard exists for, and it is not subtle: four
 # companies × two topics at the maximum k is eight searches and ~200k

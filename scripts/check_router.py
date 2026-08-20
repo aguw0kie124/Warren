@@ -101,6 +101,21 @@ PICK_NAMES = ("nvidia", "nvda", "apple", "aapl", "microsoft", "msft", "alphabet"
               "broadcom", "avgo", "palantir", "pltr", "advanced micro", "amd",
               "salesforce", "crm", "oracle", "orcl", "netflix", "nflx")
 
+def introduced_names(answer: str, question: str) -> set[str]:
+    """Companies the *answer* put on the table that the *question* did not.
+
+    The rule being enforced is "a refusal that lists candidates has made the
+    recommendation", and that is about names the assistant supplies. A name the
+    user already chose is not a candidate — it is the subject — and forbidding
+    it costs the one thing that makes a decline useful: "I can't rate <their
+    company>, but I can analyse its margins — want that?" Echoing their choice
+    back is not a pick; introducing a second company is.
+    """
+    asked = question.lower()
+    said = answer.lower()
+    return {name for name in PICK_NAMES if name in said and name not in asked}
+
+
 REFUSAL_MARKERS = ("cannot", "can't", "not able", "unable", "don't recommend",
                    "do not recommend", "not something i can", "no tool",
                    "can't screen", "cannot screen", "not in a position")
@@ -198,12 +213,18 @@ def check_answers(quiet: bool) -> None:
     """One answer per terminal route — the prose claims, which have no tool signature."""
     rule("2. what the terminal routes actually say")
 
-    for question, expected in [
+    cases = [
         ("Who is Tesla's CEO?", "simple"),
         ("What are some good tech stocks to buy right now?", "advisory"),
+        # The named-company advisory question, which is the shape people
+        # actually type. It must decline the rating without declining the
+        # company: the offer is worthless if it cannot say which company it is
+        # offering to research.
+        ("Apple stock analysis, need buy rating for a tech heavy investor", "advisory"),
         ("Tell me about their risks.", "clarify"),
-    ]:
-        rule(f"2{'abc'[['simple', 'advisory', 'clarify'].index(expected)]}. {expected} · {question}")
+    ]
+    for i, (question, expected) in enumerate(cases):
+        rule(f"2{'abcdefg'[i]}. {expected} · {question}")
         state = run(question)
         answer = agent.final_text(state["messages"])
         lowered = answer.lower()
@@ -227,16 +248,21 @@ def check_answers(quiet: bool) -> None:
         if expected == "advisory":
             verdict(any(m in lowered for m in REFUSAL_MARKERS),
                     "declines to produce a pick list")
-            named = sorted({n for n in PICK_NAMES if n in lowered})
+            named = sorted(introduced_names(answer, question))
             verdict(
                 not named,
-                "names no company or ticker as a pick"
+                "introduces no company or ticker of its own"
                 + (f" (named {', '.join(named)} — a refusal that lists candidates "
                    f"has made the recommendation)" if named else ""),
             )
+            verdict(answer.rstrip().endswith("?"),
+                    "ends by offering to research something instead"
+                    + ("" if answer.rstrip().endswith("?")
+                       else " — a decline with no offer is a dead end, and most "
+                            "questions arrive underspecified rather than settled"))
         if expected == "clarify":
             verdict("?" in answer, "asks a question back")
-            named = sorted({n for n in PICK_NAMES if n in lowered})
+            named = sorted(introduced_names(answer, question))
             verdict(not named,
                     "offers no menu of companies to pick from"
                     + (f" (named {', '.join(named)})" if named else ""))

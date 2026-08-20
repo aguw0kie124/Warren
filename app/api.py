@@ -9,10 +9,18 @@ get built (the lifespan, not per-request), how many runs may overlap
 (`MAX_CONCURRENT_RUNS`), and what failure looks like as a status code.
 
 `thread_id` is client-held and never inferred — deriving it from an IP or
-header would let two users behind one NAT share a conversation. Non-streaming;
-SSE stays Phase 2. See `scripts/check_api.py` for the concurrency gate.
+header would let two users behind one NAT share a conversation. See
+`scripts/check_api.py` for the concurrency gate.
+
+`POST /query` and `POST /query/stream` are the same run, reported two ways.
+The blocking form stays because every gate and every offline test calls it and
+because a client that just wants an answer should not have to parse a protocol
+to get one. The streaming form exists because the run takes 20-60 seconds, and
+a progress bar that cannot say *what* is being read is only marginally better
+than silence.
 """
 
+import json
 import logging
 import threading
 import time
@@ -22,7 +30,7 @@ from dataclasses import dataclass
 
 import psycopg
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from langgraph.errors import GraphRecursionError
 from psycopg_pool import PoolTimeout
 from pydantic import BaseModel, Field, field_validator
@@ -141,6 +149,7 @@ class AgentRuntime:
 
     graph: object
     answer: object
+    stream_answer: object
     thread_state: object
     llm_error: str | None
     started_at: float
@@ -180,6 +189,7 @@ async def lifespan(app: FastAPI):
     app.state.runtime = AgentRuntime(
         graph=graph,
         answer=agent.answer,
+        stream_answer=agent.stream_answer,
         thread_state=agent.thread_state,
         llm_error=llm_error,
         started_at=time.time(),
@@ -297,6 +307,84 @@ def query(
     # `response_model=QueryResponse` is what drops `messages` (LangChain
     # objects, often enormous) from the four keys `answer()` returns.
     return runtime.answer(payload.question, payload.thread_id)
+
+
+# ---------------------------------------------------------------------------
+# The same run, streamed
+# ---------------------------------------------------------------------------
+#
+# Server-sent events rather than a WebSocket: the traffic is one-directional and
+# one-shot, `fetch` can read it without a second protocol, and the run is not
+# cancellable anyway (`graph.stream()` is as uninterruptible as `graph.invoke()`
+# was), so the return channel a socket would buy has nothing to carry.
+#
+# **Every frame is `data:` with a `type` inside**, rather than SSE named events.
+# One parser on the client, one place to add an event, and `json.dumps` escapes
+# newlines — so a frame is always exactly one line and the framing cannot be
+# broken by an answer that contains a blank line.
+#
+# **The run slot is taken by hand here, not through `Depends(run_slot)`.** A
+# generator dependency is torn down when the *response* completes, and for a
+# StreamingResponse that is a different moment from when the handler returns —
+# the handler returns immediately, before the graph has run at all. Depending on
+# it would release the slot at the start of the run instead of the end, which is
+# a cap that silently stops capping. Acquired before the response is built so
+# "at capacity" is still a real 503 with a status line, released in the
+# generator's `finally` so it survives a client that disconnects mid-run.
+
+
+def _frame(event: dict) -> str:
+    """One SSE frame. `json.dumps` guarantees it stays a single line."""
+    return f"data: {json.dumps(event)}\n\n"
+
+
+@app.post("/query/stream")
+def query_stream(
+    payload: QueryRequest, runtime: AgentRuntime = Depends(get_runtime)
+) -> StreamingResponse:
+    """Answer one question, reporting progress as it goes.
+
+    Same request body, same conversation, same answer as `POST /query`. The
+    response is a `text/event-stream` of the events `agent.stream_answer()`
+    documents — `start`, `route`, `step`, `sources`, `token`, `reset`, `done`,
+    `error`.
+
+    **A failure after the first frame arrives as an `error` event, not a status
+    code.** The status line is long gone by then, so the alternative is a
+    truncated body, which a client cannot tell from a short answer. The two
+    failures that can still be status codes — no model key, and over the
+    concurrency cap — are raised before the response is built, and deliberately
+    so: those are the two a client can do something about.
+    """
+    if runtime.llm_error:
+        raise HTTPException(status_code=503, detail=runtime.llm_error)
+
+    if not _run_slots.acquire(blocking=False):
+        raise HTTPException(
+            status_code=503,
+            detail=f"at capacity ({MAX_CONCURRENT_RUNS} runs in flight); retry shortly",
+            headers={"Retry-After": str(RETRY_AFTER_SECONDS)},
+        )
+
+    def events():
+        try:
+            for event in runtime.stream_answer(payload.question, payload.thread_id):
+                yield _frame(event)
+        finally:
+            _run_slots.release()
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            # Nginx and friends buffer a proxied response by default, which
+            # would hold every frame until the run finished and deliver the
+            # whole stream at once — the exact silence this endpoint removes,
+            # reintroduced by infrastructure and invisible in development.
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/threads/{thread_id}", response_model=ThreadResponse)

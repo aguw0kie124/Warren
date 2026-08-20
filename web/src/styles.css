@@ -374,6 +374,97 @@ button {
   margin-bottom: 6px;
 }
 
+.answer ol {
+  margin: 0 0 10px;
+  padding-left: 22px;
+}
+
+/* Headings inside an answer are subheads within a paragraph flow, not page
+   titles — they sit barely above body size and lean on weight and colour
+   instead, so a three-part answer reads as one piece rather than a document. */
+.answer h1,
+.answer h2,
+.answer h3,
+.answer h4 {
+  margin: 18px 0 8px;
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: 0.1px;
+  color: var(--text);
+}
+
+.answer h1:first-child,
+.answer h2:first-child,
+.answer h3:first-child {
+  margin-top: 0;
+}
+
+.answer a:not(.marker) {
+  color: var(--text);
+  text-decoration: underline;
+  text-decoration-color: var(--line-strong);
+  text-underline-offset: 2px;
+}
+
+.answer a:not(.marker):hover {
+  text-decoration-color: var(--accent);
+}
+
+.answer blockquote {
+  margin: 0 0 10px;
+  padding-left: 12px;
+  border-left: 2px solid var(--line-strong);
+  color: var(--text-2);
+}
+
+.answer hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 16px 0;
+}
+
+/* A financial table scrolls inside its own box. The answer column must never
+   scroll sideways as a whole — that takes the prose with it. */
+.table-wrap {
+  overflow-x: auto;
+  margin: 0 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.answer table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+}
+
+.answer th,
+.answer td {
+  padding: 7px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+/* Figures are read down the column and compared, so they are monospaced and
+   right-aligned — every cell but the first, which is the row's label. */
+.answer td:not(:first-child),
+.answer th:not(:first-child) {
+  text-align: right;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 12px;
+}
+
+.answer th {
+  background: var(--raised);
+  font-weight: 600;
+  color: var(--text-2);
+}
+
+.answer tr:last-child td {
+  border-bottom: 0;
+}
+
 .answer code {
   font-family: "JetBrains Mono", ui-monospace, monospace;
   font-size: 12.5px;
@@ -426,6 +517,11 @@ button {
 }
 
 /* ---------- sources ---------- */
+
+.sources {
+  display: flex;
+  flex-direction: column;
+}
 
 .sources-label {
   font-size: 11px;
@@ -504,14 +600,100 @@ button {
   color: #a7abb1;
 }
 
-/* ---------- thinking ---------- */
+/* The expander is a chip like the sources it reveals, so the row reads as one
+   list with a last entry rather than a list plus a control. */
+.source.more {
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--text-3);
+}
 
-.thinking {
+.source.more:hover {
+  color: var(--text);
+  border-color: #3a3d42;
+}
+
+/* ---------- steps ---------- */
+
+.steps {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-3);
+}
+
+.steps.live {
+  padding-bottom: 2px;
+}
+
+.phase {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   font-size: 13.5px;
+  font-weight: 500;
+  color: var(--text-2);
+}
+
+.step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   color: var(--text-3);
+  animation: rise 0.25s ease-out;
+}
+
+.step-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--accent);
+  opacity: 0.65;
+}
+
+.step-dot.done {
+  background: var(--line-strong);
+}
+
+.steps-toggle {
+  align-self: flex-start;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text-4);
+  cursor: pointer;
+}
+
+.steps-toggle:hover {
+  color: var(--text-2);
+}
+
+.caret {
+  display: inline-block;
+  transition: transform 0.15s;
+}
+
+.caret.open {
+  transform: rotate(90deg);
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .dots {
@@ -533,12 +715,6 @@ button {
 
 .dots i:nth-child(3) {
   animation-delay: 0.4s;
-}
-
-.elapsed {
-  font-family: "JetBrains Mono", ui-monospace, monospace;
-  font-size: 11.5px;
-  color: var(--text-4);
 }
 
 /* ---------- composer ---------- */

@@ -16,7 +16,7 @@ Three of them are worth naming, because none would show up as an error:
 - **A leaked run slot.** The semaphore is bounded, so a slot released twice
   raises, but a slot never released just lowers the cap by one, permanently and
   invisibly, until the service refuses everything.
-- **Surface creep.** Three endpoints is the whole spec. A fourth added in
+- **Surface creep.** Four endpoints is the whole spec. A fifth added in
   passing is exactly the kind of thing nothing else notices.
 
 The mechanic that keeps all of this offline: `TestClient(app)` is constructed
@@ -26,6 +26,7 @@ no model is ever built. That mirrors `ScriptedModel` in tests/test_agent.py.
 """
 
 import importlib
+import json
 import sys
 import threading
 from contextlib import contextmanager
@@ -75,6 +76,30 @@ class FakeRuntime:
         if isinstance(self._result, Exception):
             raise self._result
         return self._result
+
+    def stream_answer(self, question, thread_id=None, **kwargs):
+        """The streaming form, scripted.
+
+        `agent.stream_answer` yields an `error` event rather than raising, so
+        this does too — a fake that raised would let a test pass against
+        behaviour the real generator does not have.
+        """
+        self.calls.append((question, thread_id))
+        if isinstance(self._result, Exception):
+            yield {"type": "error", "detail": str(self._result)}
+            return
+        result = self._result
+        yield {"type": "start", "thread_id": result["thread_id"]}
+        yield {"type": "route", "route": result["route"]}
+        yield {"type": "step", "label": "Reading AAPL filings — Item 1A Risk Factors"}
+        yield {"type": "sources",
+               "citations": [c.model_dump() for c in result["citations"]]}
+        yield {"type": "token", "text": result["answer"]}
+        yield {"type": "done",
+               "answer": result["answer"],
+               "citations": [c.model_dump() for c in result["citations"]],
+               "thread_id": result["thread_id"],
+               "route": result["route"]}
 
     def thread_state(self, thread_id):
         return self._state
@@ -368,9 +393,11 @@ def test_edgar_user_agent_is_not_a_health_requirement():
 # --- structural -------------------------------------------------------------
 
 
-def test_the_service_exposes_exactly_three_endpoints():
-    """Three is the whole spec. A fourth added in passing is the thing this
-    step most easily does by accident, and nothing else would notice."""
+def test_the_service_exposes_exactly_four_endpoints():
+    """Four is the whole spec, and the fourth was argued for: `/query/stream`
+    is the same run as `/query`, not a new capability. A fifth added in passing
+    is the thing this step most easily does by accident, and nothing else would
+    notice."""
     routes = {
         (route.path, method)
         for route in app.routes
@@ -382,6 +409,7 @@ def test_the_service_exposes_exactly_three_endpoints():
 
     assert routes == {
         ("/query", "POST"),
+        ("/query/stream", "POST"),
         ("/health", "GET"),
         ("/threads/{thread_id}", "GET"),
     }
@@ -404,3 +432,121 @@ def test_importing_the_api_opens_no_connection_and_needs_no_key(monkeypatch):
     fresh = importlib.import_module("app.api")
 
     TestClient(fresh.app)
+
+
+# --- /query/stream ----------------------------------------------------------
+#
+# The streaming endpoint's failures are quieter than the blocking one's. It
+# cannot report a mid-run failure as a status code, so an exception surfaces as
+# a truncated body — indistinguishable from a short answer. And its run slot is
+# taken by hand rather than through `Depends`, because a generator dependency is
+# torn down when the *response* completes, which for a StreamingResponse is
+# before the graph has run at all.
+
+
+def frames(response) -> list[dict]:
+    """The events in an SSE body, in order."""
+    return [
+        json.loads(line[len("data:"):].strip())
+        for line in response.text.splitlines()
+        if line.startswith("data:")
+    ]
+
+
+def test_the_stream_reports_the_run_and_ends_with_done(client, runtime):
+    response = client.post("/query/stream", json={"question": "What are Apple's risks?"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+
+    events = frames(response)
+    assert [e["type"] for e in events][0] == "start"
+    assert [e["type"] for e in events][-1] == "done"
+    assert {"route", "step", "sources", "token"} <= {e["type"] for e in events}
+
+    done = events[-1]
+    assert done["answer"] == "Apple lists supply concentration among its risks."
+    assert done["citations"] == [
+        {"type": "filing", "label": "AAPL FY2025 10-K · Item 1A",
+         "source_url": "https://sec.gov/x.htm"}
+    ]
+
+
+def test_the_stream_carries_the_thread_id_down_and_back(client, runtime):
+    client.post("/query/stream", json={"question": "and the second one?",
+                                       "thread_id": "thread-42"})
+    assert runtime.calls == [("and the second one?", "thread-42")]
+
+
+def test_a_blank_question_is_rejected_before_the_stream_opens(client, runtime):
+    """422 while a status line is still possible. Validation is the one class of
+    failure this endpoint can still report the ordinary way, and it should."""
+    response = client.post("/query/stream", json={"question": "   "})
+    assert response.status_code == 422
+    assert runtime.calls == []
+
+
+def test_a_missing_key_is_a_503_not_an_error_event(client):
+    """Raised before the response is built, so it keeps its status code — a
+    client can act on 'no key configured', unlike a mid-run failure."""
+    app.dependency_overrides[get_runtime] = lambda: FakeRuntime(llm_error="no key")
+    assert client.post("/query/stream", json={"question": "q"}).status_code == 503
+    app.dependency_overrides.clear()
+
+
+def test_a_mid_run_failure_arrives_as_an_error_event(client):
+    """Not a 500. The status line is already sent, so the alternative is a
+    truncated body, which reads as a short answer rather than a failure."""
+    app.dependency_overrides[get_runtime] = lambda: FakeRuntime(
+        result=GraphRecursionError("too many steps")
+    )
+    response = client.post("/query/stream", json={"question": "q"})
+
+    assert response.status_code == 200
+    assert frames(response)[-1] == {"type": "error", "detail": "too many steps"}
+    app.dependency_overrides.clear()
+
+
+def test_the_slot_is_held_for_the_whole_stream_and_then_released(monkeypatch):
+    """The bug `Depends(run_slot)` would have introduced, caught directly.
+
+    A generator dependency releases when the response completes, and a
+    StreamingResponse completes the moment the handler returns — before the
+    graph has run. Under that wiring the cap would still exist and would stop
+    capping, which nothing else here would notice.
+    """
+    monkeypatch.setattr(api, "_run_slots", threading.BoundedSemaphore(1))
+    release = threading.Event()
+    entered = threading.Event()
+
+    class BlockingRuntime(FakeRuntime):
+        def stream_answer(self, question, thread_id=None, **kwargs):
+            yield {"type": "start", "thread_id": "t"}
+            entered.set()
+            release.wait(timeout=5)
+            yield {"type": "done", "answer": "a", "citations": [],
+                   "thread_id": "t", "route": "research"}
+
+    app.dependency_overrides[get_runtime] = lambda: BlockingRuntime()
+    client = TestClient(app)
+    first: list = []
+
+    holder = threading.Thread(
+        target=lambda: first.append(
+            client.post("/query/stream", json={"question": "q"})
+        )
+    )
+    holder.start()
+    assert entered.wait(timeout=5)
+
+    blocked = client.post("/query/stream", json={"question": "q"})
+    assert blocked.status_code == 503
+    assert blocked.headers["Retry-After"] == str(api.RETRY_AFTER_SECONDS)
+
+    release.set()
+    holder.join(timeout=5)
+    assert first[0].status_code == 200
+
+    # Released in the generator's `finally`, so the cap recovers.
+    assert client.post("/query/stream", json={"question": "q"}).status_code == 200
+    app.dependency_overrides.clear()

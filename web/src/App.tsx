@@ -3,7 +3,6 @@ import { Composer } from "./components/Composer";
 import { EmptyState } from "./components/EmptyState";
 import { Message } from "./components/Message";
 import { Sidebar } from "./components/Sidebar";
-import { Thinking } from "./components/Thinking";
 import * as api from "./lib/api";
 import { marketStatus } from "./lib/market";
 import { loadThreads, saveThreads, titleFor } from "./lib/threads";
@@ -92,52 +91,106 @@ export default function App() {
       const question = raw.trim();
       if (!question || busy) return;
 
+      const id = nextId();
       setMessages((prev) => [
         ...prev,
         { id: nextId(), role: "user", text: question },
+        { id, role: "assistant", text: "", streaming: true, steps: [] },
       ]);
       setInput("");
       setBusy(true);
 
-      try {
-        const result = await api.query(question, threadId);
-        const fresh = result.citations.filter((c) => !seen.current.has(key(c)));
-        fresh.forEach((c) => seen.current.add(key(c)));
+      // Only this turn's new sources belong under this turn, and the server
+      // sends the thread's whole list — so what counts as "already shown" is
+      // frozen here, before the turn adds to it.
+      const already = new Set(seen.current);
+      const patch = (change: Partial<ChatMessage>) =>
+        setMessages((prev) =>
+          prev.map((m) => (m.id === id ? { ...m, ...change } : m)),
+        );
 
-        setThreadId(result.thread_id);
-        setThreads((prev) => {
-          const rest = prev.filter((t) => t.id !== result.thread_id);
-          const existing = prev.find((t) => t.id === result.thread_id);
-          return [
-            {
-              id: result.thread_id,
-              title: existing?.title ?? titleFor(question),
-              updatedAt: Date.now(),
-            },
-            ...rest,
-          ];
+      try {
+        await api.streamQuery(question, threadId, (event) => {
+          switch (event.type) {
+            case "start":
+              setThreadId(event.thread_id);
+              setThreads((prev) => {
+                const existing = prev.find((t) => t.id === event.thread_id);
+                return [
+                  {
+                    id: event.thread_id,
+                    title: existing?.title ?? titleFor(question),
+                    updatedAt: Date.now(),
+                  },
+                  ...prev.filter((t) => t.id !== event.thread_id),
+                ];
+              });
+              break;
+
+            case "route":
+              patch({ route: event.route });
+              break;
+
+            case "step":
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === id ? { ...m, steps: [...(m.steps ?? []), event.label] } : m,
+                ),
+              );
+              break;
+
+            case "sources": {
+              const fresh = event.citations.filter((c) => !already.has(key(c)));
+              fresh.forEach((c) => seen.current.add(key(c)));
+              if (fresh.length) {
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === id
+                      ? { ...m, citations: [...(m.citations ?? []), ...fresh] }
+                      : m,
+                  ),
+                );
+              }
+              break;
+            }
+
+            case "token":
+              setMessages((prev) =>
+                prev.map((m) => (m.id === id ? { ...m, text: m.text + event.text } : m)),
+              );
+              break;
+
+            case "reset":
+              // That model turn was a preamble to a tool call, not the answer.
+              patch({ text: "" });
+              break;
+
+            case "done":
+              // The server's own final read, which is what `POST /query` would
+              // have returned. Preferred over the accumulated tokens so a
+              // dropped frame cannot leave a subtly truncated answer standing.
+              patch({
+                text: event.answer,
+                route: event.route,
+                streaming: false,
+              });
+              break;
+
+            case "error":
+              patch({ text: event.detail, error: true, streaming: false });
+              break;
+          }
         });
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: nextId(),
-            role: "assistant",
-            text: result.answer,
-            citations: fresh,
-            route: result.route,
-          },
-        ]);
       } catch (error) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: nextId(),
-            role: "assistant",
-            text: (error as Error).message,
-            error: true,
-          },
-        ]);
+        patch({
+          text: (error as Error).message,
+          error: true,
+          streaming: false,
+        });
       } finally {
+        // Belt and braces: a stream that ends without `done` or `error` — a
+        // dropped connection — must still stop rendering as in-flight.
+        patch({ streaming: false });
         setBusy(false);
       }
     },
@@ -176,7 +229,6 @@ export default function App() {
                 <Message key={message.id} message={message} />
               ))
             )}
-            {busy && <Thinking />}
           </div>
         </div>
 
