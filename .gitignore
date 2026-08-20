@@ -20,3 +20,7 @@ docs/*.bak
 
 # Phase 2 plan doc — working notes, not committed. README covers the project.
 docs/phase-2-plan.md
+
+# Claude Code skills — a personal tool install (langsmith-skills etc.), not
+# project source. Re-fetch from the upstream repo rather than committing it.
+.claude/
