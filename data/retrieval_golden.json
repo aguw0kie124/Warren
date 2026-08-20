@@ -1,0 +1,175 @@
+{
+  "_readme": "Golden set for retrieval evals. SEEDED FROM data/retrieval_a7.json, WHICH IS A SYSTEM OUTPUT DUMP AND NOT GROUND TRUTH. A row counts as a label only at status='confirmed'. 'seeded' means the dump's results were read and are on topic but no human has signed off; 'unlabelled' means they were read and REJECTED, so the query is carried with no labels and is excluded from scoring. Treating the retriever's own output as the target would bake today's behaviour in as the goal.",
+  "seeded_from": "data/retrieval_a7.json",
+  "seeded_at": "2026-08-19",
+  "statuses": {
+    "confirmed": "a human verified these chunks are the right answer - counts as a label",
+    "seeded": "on-topic but unverified - scored, and reported as provisional",
+    "unlabelled": "seed rejected; no labels yet - excluded from scoring"
+  },
+  "queries": [
+    {
+      "id": "aapl-business-risks",
+      "query": "What are Apple's main business risks?",
+      "kind": "semantic",
+      "filters": {
+        "ticker": "AAPL"
+      },
+      "status": "seeded",
+      "note": "Top-3 are all AAPL Item 1A risk-factor prose and on topic.",
+      "relevant": [
+        {
+          "accession_number": "0000320193-25-000079",
+          "chunk_index": 14,
+          "section": "Item 1A Risk Factors"
+        },
+        {
+          "accession_number": "0000320193-25-000079",
+          "chunk_index": 24,
+          "section": "Item 1A Risk Factors"
+        },
+        {
+          "accession_number": "0000320193-25-000079",
+          "chunk_index": 8,
+          "section": "Item 1A Risk Factors"
+        }
+      ]
+    },
+    {
+      "id": "msft-revenue-growth",
+      "query": "How is the company growing revenue?",
+      "kind": "semantic",
+      "filters": {
+        "ticker": "MSFT"
+      },
+      "status": "seeded",
+      "note": "Top-3 are MSFT Item 7 MD&A segment-revenue discussion; on topic.",
+      "relevant": [
+        {
+          "accession_number": "0001193125-26-323660",
+          "chunk_index": 58,
+          "section": "Item 7 MD&A"
+        },
+        {
+          "accession_number": "0001193125-26-323660",
+          "chunk_index": 56,
+          "section": "Item 7 MD&A"
+        },
+        {
+          "accession_number": "0001193125-26-323660",
+          "chunk_index": 59,
+          "section": "Item 7 MD&A"
+        }
+      ]
+    },
+    {
+      "id": "tsla-supply-disruption",
+      "query": "What could disrupt manufacturing and supply?",
+      "kind": "semantic",
+      "filters": {
+        "ticker": "TSLA"
+      },
+      "status": "seeded",
+      "note": "Top-3 are TSLA Item 1A supplier/component/factory-ramp risk; on topic.",
+      "relevant": [
+        {
+          "accession_number": "0001628280-26-003952",
+          "chunk_index": 21,
+          "section": "Item 1A Risk Factors"
+        },
+        {
+          "accession_number": "0001628280-26-003952",
+          "chunk_index": 22,
+          "section": "Item 1A Risk Factors"
+        },
+        {
+          "accession_number": "0001628280-26-003952",
+          "chunk_index": 23,
+          "section": "Item 1A Risk Factors"
+        }
+      ]
+    },
+    {
+      "id": "meta-ai-risk",
+      "query": "Risks from artificial intelligence investment",
+      "kind": "semantic",
+      "filters": {
+        "ticker": "META"
+      },
+      "status": "seeded",
+      "note": "Top-3 are META's 'we may not be successful in our AI initiatives' risk factor across three filings; on topic.",
+      "relevant": [
+        {
+          "accession_number": "0001628280-26-028526",
+          "chunk_index": 41,
+          "section": "Item 1A Risk Factors"
+        },
+        {
+          "accession_number": "0001628280-26-050705",
+          "chunk_index": 45,
+          "section": "Item 1A Risk Factors"
+        },
+        {
+          "accession_number": "0001628280-26-003942",
+          "chunk_index": 27,
+          "section": "Item 1A Risk Factors"
+        }
+      ]
+    },
+    {
+      "id": "exact-material-weakness",
+      "query": "material weakness in internal control",
+      "kind": "exact",
+      "filters": {},
+      "status": "unlabelled",
+      "note": "REJECTED as a label. The dump's top-3 are cybersecurity and IT-systems prose; none discusses a material weakness in internal control over financial reporting. This is the retriever missing, not a ground truth. Needs a human to find the true relevant chunks, or to record that the corpus contains none.",
+      "relevant": []
+    },
+    {
+      "id": "exact-going-concern",
+      "query": "going concern",
+      "kind": "exact",
+      "filters": {},
+      "status": "unlabelled",
+      "note": "REJECTED as a label. The dump's top-3 are loss contingencies, income-tax accounting and debt-refinancing prose. No covered filer discloses going-concern doubt, so the honest label is probably the empty set - which makes this a negative-control query rather than a recall one.",
+      "relevant": []
+    },
+    {
+      "id": "exact-item-7a",
+      "query": "Item 7A quantitative and qualitative disclosures",
+      "kind": "exact",
+      "filters": {},
+      "status": "unlabelled",
+      "note": "REJECTED as a label. The query names a section header (Item 7A Quantitative and Qualitative Disclosures About Market Risk) that the parser does not extract as a section at all, so the top-3 are adjacent MD&A prose. Decide whether this query should exist before labelling it.",
+      "relevant": []
+    },
+    {
+      "id": "aapl-effective-tax-rate",
+      "query": "effective tax rate",
+      "kind": "exact",
+      "filters": {
+        "ticker": "AAPL"
+      },
+      "status": "seeded",
+      "note": "Top-3 all carry AAPL effective-tax-rate tables and discussion; on topic.",
+      "relevant": [
+        {
+          "accession_number": "0000320193-26-000020",
+          "chunk_index": 10,
+          "section": "Item 2 MD&A"
+        },
+        {
+          "accession_number": "0000320193-26-000013",
+          "chunk_index": 9,
+          "section": "Item 2 MD&A"
+        },
+        {
+          "accession_number": "0000320193-25-000079",
+          "chunk_index": 43,
+          "section": "Item 7 MD&A"
+        }
+      ]
+    }
+  ],
+  "_bias_warning": "THE SEED IS BIASED TOWARDS DENSE RETRIEVAL. A7 is the dense (vector) retriever, so data/retrieval_a7.json records what DENSE returned - its 'score' values are cosine similarities, not the ~0.03 an RRF fusion produces. Scoring dense against this seed therefore measures dense against its own output and reads near 1.000, while hybrid is penalised for ranking differently rather than for ranking worse. Measured at k=6: dense 1.000, hybrid 0.800. That delta is an artefact of the seed and MUST NOT be read as dense beating hybrid. Confirming rows is what makes the comparison mean anything."
+}

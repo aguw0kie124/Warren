@@ -17,3 +17,6 @@ data/retrieval_a7.json
 # ~/.claude/plans/want-to-design-a-golden-barto.md
 docs/PLAN.md
 docs/*.bak
+
+# Phase 2 plan doc — working notes, not committed. README covers the project.
+docs/phase-2-plan.md

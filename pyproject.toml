@@ -56,6 +56,14 @@ dependencies = [
     # spawns it as a subprocess. [standard] because the documented dev command
     # uses --reload, which needs watchfiles.
     "uvicorn[standard]>=0.30",
+    # --- Phase 2: observability + evals ---
+    # Arrives transitively under langchain-core, and declared anyway for the
+    # same reason `anthropic` is: scripts/check_retrieval_quality.py imports
+    # Client and evaluate by name, and a transitive dependency is not a promise
+    # about what it exports. It is also what carries LangSmith tracing, which
+    # langchain reads straight from the environment.
+    "langsmith>=0.11",
+
     # No httpx entry here on purpose — it is already declared above for the
     # EDGAR client, and it is what both fastapi's TestClient and check_api.py
     # use. Adding it twice would just create two floors to keep in sync.
