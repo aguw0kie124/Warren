@@ -35,7 +35,7 @@ from langgraph.errors import GraphRecursionError
 from psycopg_pool import PoolTimeout
 from pydantic import BaseModel, Field, field_validator
 
-from app import agent, embeddings, finnhub, sec_http
+from app import agent, embeddings, prices, sec_http
 from app.config import settings
 from app.db import close_pool, get_conn, init_schema
 from app.tools import Citation
@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 # near 8-9 while anyio's default of 40 threads would peak at 80-160. The
 # checkpointer isn't a pressure point (PostgresSaver serialises onto one
 # connection via its own lock); `embeddings._encode_lock` and
-# `finnhub._RateLimiter` are the other two serialisation points worth knowing
+# `prices._RateLimiter` are the other two serialisation points worth knowing
 # about. Full arithmetic in CLAUDE.md. Per process — `--workers N` multiplies
 # both this and the embedding model's memory footprint.
 MAX_CONCURRENT_RUNS = 4
@@ -69,7 +69,6 @@ _run_slots = threading.BoundedSemaphore(MAX_CONCURRENT_RUNS)
 # SEC, so it's an ingestion requirement, not a serving one.
 REQUIRED_KEYS = (
     ("ANTHROPIC_API_KEY", "anthropic_api_key"),
-    ("FINNHUB_API_KEY", "finnhub_api_key"),
     ("TAVILY_API_KEY", "tavily_api_key"),
 )
 
@@ -199,7 +198,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # No checkpointer close — it rides the pool.
-    finnhub.close_client()
+    prices.close_client()
     sec_http.close_client()
     close_pool()
 

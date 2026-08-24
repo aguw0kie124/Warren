@@ -18,9 +18,11 @@ pass-through.** Measured at ~8µs per call on this machine against functions
 whose fastest member is a network round trip, which is why the decorators can
 sit on the hot path unconditionally rather than behind a flag.
 
-**What is deliberately NOT traced.** `finnhub` and `websearch` calls are one
+**What is deliberately NOT traced.** `prices` and `websearch` calls are one
 HTTP request each behind a tool that already reports its own arguments and
-result, so a span would restate the parent. The parser and chunker run in
+result, so a span would restate the parent. `get_key_stats` is three sequential
+requests inside one attribute access, which is a cost the parent span's duration
+already shows, not a hidden decision. The parser and chunker run in
 `scripts/ingest.py`, which is an offline batch job and not a request path. The
 rule applied here: instrument a function when the tool span above it hides a
 decision or a cost, not merely because it is on the path.

@@ -2,10 +2,10 @@
 
 Deliberately thin. Every function here delegates to a plain function that
 already exists and was verified on its own gate: `retriever.hybrid_search`
-(A8), `app.finnhub` (B1), `app.websearch` (B2). Nothing new is computed. What
+(A8), `app.prices` (B1), `app.websearch` (B2). Nothing new is computed. What
 this file adds is three things a model needs and a plain function doesn't:
 
-1. **Docstrings that route.** Five tools, three of which plausibly answer
+1. **Docstrings that route.** Six tools, four of which plausibly answer
    "what's going on with Apple." There is no router node in the graph — a
    tool-calling model *is* the router — so the docstrings are the routing
    logic, not commentary on it. Each says what its tool is for and when to
@@ -13,7 +13,7 @@ this file adds is three things a model needs and a plain function doesn't:
    fix.
 
 2. **Citations assembled in code.** Every tool that produces sources returns
-   `Citation` objects alongside its text, tagged `filing` / `news` / `web`.
+   `Citation` objects alongside its text, tagged `filing` / `web`.
    They ride on the ToolMessage as an *artifact*, so the model never sees the
    objects and can never reformat a URL or invent an accession number — the
    retriever and the APIs already know the ground truth.
@@ -21,7 +21,7 @@ this file adds is three things a model needs and a plain function doesn't:
 3. **A corpus-gap result distinct from an empty one.** See `search_filings`.
 
 Failures are reported as text rather than raised. A tool that raises tells the
-model "something broke"; a tool that says "Finnhub has no symbol APPL" tells it
+model "something broke"; a tool that says "Yahoo has no symbol APPL" tells it
 what to do next.
 """
 
@@ -31,7 +31,7 @@ from typing import Literal
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
-from app import finnhub, fundamentals, retriever, websearch
+from app import fundamentals, prices, retriever, websearch
 from app.db import get_conn
 from app.edgar import filing_index_url
 from app.parser import SECTIONS_10K, SECTIONS_10Q
@@ -51,33 +51,28 @@ VALID_FORM_TYPES: tuple[str, ...] = ("10-K", "10-Q")
 # swallow the context window.
 MAX_K = 12
 
-# Finnhub summaries are usually a sentence or two; the occasional one is a
-# whole article. Cut it — the URL is in the citation if more is wanted.
-MAX_SUMMARY_CHARS = 600
-
-# `limit` is exposed on get_company_news for the same reason `k` is on
-# search_filings, and clamped for the same reason — but the binding cost here
-# is not the context window, it is the **citation list**. Every article becomes
-# a citation, so one unclamped news call can put twenty-odd sources under an
-# answer that leaned on two of them, and a source list nobody can scan is
-# indistinguishable from one that was never checked.
-MAX_NEWS_LIMIT = 10
-
 _STALENESS_NOTE = (
     "Note: filings state the company's position as of their filing date only. "
-    "For anything that happened since, use get_company_news or web_search."
+    "For anything that happened since, use web_search with a `days` window."
 )
 
 
 class Citation(BaseModel):
     """One source, assembled in code from what the tool already knows.
 
-    `type` is what lets an answer distinguish an audited SEC filing from a news
-    article from a web page — three things that are not equally authoritative,
-    and a reader deserves to see which is which.
+    `type` is what lets an answer distinguish an audited SEC filing from a web
+    page — two things that are not equally authoritative, and a reader deserves
+    to see which is which.
+
+    There used to be a third, `news`, produced only by a per-ticker Finnhub
+    feed. That tool was measured against `web_search` in August 2026 and
+    removed: its citation URLs had become `finnhub.io/api/news?id=...`
+    redirects rather than article URLs, so the tag claimed a provenance the
+    link did not deliver. A type that cannot be trusted to mean what it says is
+    worse than one fewer distinction.
     """
 
-    type: Literal["filing", "news", "web"]
+    type: Literal["filing", "web"]
     label: str
     source_url: str
 
@@ -158,9 +153,9 @@ def search_filings(
     stated outlook, litigation, competitive positioning.
 
     Its one limitation is time. A filing is current only as of its filing
-    date and says nothing about what happened afterwards, so for recent
-    events, price moves, or market reaction use `get_company_news` (one ticker)
-    or `web_search` (everything else).
+    date and says nothing about what happened afterwards, so for recent events
+    or market reaction use `web_search` with a `days` window, and for the price
+    itself `get_quote` or `get_price_history`.
 
     If the result reports that the company is NOT IN THE FILINGS CORPUS, say
     so plainly in your answer. That means no filings for it have been
@@ -254,7 +249,7 @@ def _describe_filters(**filters) -> str:
 
 
 # ---------------------------------------------------------------------------
-# get_quote
+# get_quote / get_key_stats / get_price_history
 # ---------------------------------------------------------------------------
 
 
@@ -264,35 +259,36 @@ class SymbolArgs(BaseModel):
 
 @tool(args_schema=SymbolArgs, response_format="content_and_artifact")
 def get_quote(symbol: str) -> tuple[str, list[Citation]]:
-    """Get the current share price and today's move for one ticker.
+    """Get the latest share price and the move from the previous session.
 
     Use for "what is X trading at", "how did X move today", or whenever an
-    answer needs a live price. Delayed on the free data tier and frozen
-    outside market hours, so the returned timestamp is part of the answer —
-    say when the price is from rather than implying it is this instant.
+    answer needs a current price. The price is the last daily close — during
+    market hours that is the day's bar in progress, after the close it is the
+    closing price — so the returned date is part of the answer. Say when the
+    price is from rather than implying it is this instant.
 
-    This is a point-in-time quote and nothing else. There is no price history
-    available anywhere in this system, so questions like "how has the stock
-    moved since the last 10-K" cannot be answered with data — say so instead
-    of estimating from the day's range.
+    This is one point in time. For how the price has moved over a period —
+    "since the last 10-K", "this year", "over five years" — call
+    `get_price_history` instead. Never estimate a move from the day's range.
     """
     try:
-        quote = finnhub.get_quote(symbol)
-    except finnhub.UnknownSymbolError as exc:
+        quote = prices.get_quote(symbol)
+    except prices.UnknownSymbolError as exc:
         return _fail(str(exc))
-    except (finnhub.FinnhubError, ValueError) as exc:
+    except (prices.PriceDataError, ValueError) as exc:
         return _fail(f"Could not fetch a quote for {symbol!r}: {exc}")
 
     change = "n/a" if quote.change is None else f"{quote.change:+.2f}"
     percent = "" if quote.percent_change is None else f" ({quote.percent_change:+.2f}%)"
+    previous = "n/a" if quote.previous_close is None else f"{quote.previous_close:.2f}"
 
     text = (
-        f"{quote.symbol} quote as of {quote.as_of} (delayed):\n"
-        f"  price           {quote.current_price:.2f}\n"
-        f"  change today    {change}{percent}\n"
+        f"{quote.symbol} quote as of {quote.as_of}:\n"
+        f"  price           {quote.price:.2f}\n"
+        f"  change          {change}{percent}\n"
         f"  open            {quote.open:.2f}\n"
         f"  day high / low  {quote.high:.2f} / {quote.low:.2f}\n"
-        f"  previous close  {quote.previous_close:.2f}"
+        f"  previous close  {previous}"
     )
     # No citation: a quote has no article behind it, and inventing a URL for
     # one would put an unverifiable source in a list whose whole value is that
@@ -300,133 +296,105 @@ def get_quote(symbol: str) -> tuple[str, list[Citation]]:
     return text, []
 
 
-# ---------------------------------------------------------------------------
-# get_basic_financials
-# ---------------------------------------------------------------------------
-
-
 @tool(args_schema=SymbolArgs, response_format="content_and_artifact")
-def get_basic_financials(symbol: str) -> tuple[str, list[Citation]]:
-    """Get valuation ratios, margins, and growth rates for one ticker.
+def get_key_stats(symbol: str) -> tuple[str, list[Citation]]:
+    """Get market-computed valuation ratios and the 52-week range for one ticker.
 
-    Use for "is X expensive", "what are X's margins", or to put a filing's
-    stated outlook next to what the market currently prices in. Covers P/E,
-    P/S, P/B, margins, ROE/ROA, revenue and EPS growth, leverage, dividend
-    yield, beta, and the 52-week range.
+    Use for "is X expensive", "what is X's P/E", "how far is X off its highs",
+    or to put a filing's stated outlook next to what the market currently
+    prices in. Covers trailing and forward P/E, price/book, price/sales,
+    EV/EBITDA, margins, return on equity, leverage, beta, market cap, dividend
+    yield, and the 52-week high and low.
 
-    These are the market-data provider's own computed figures — point-in-time
-    and NOT audited, unlike a filing. For a number the company itself
-    reported, and for the surrounding explanation of it, use `search_filings`.
-    Metrics the provider does not have are simply absent; do not read an
-    absence as a zero.
+    These are the market-data provider's own figures: computed, point-in-time,
+    unaudited, and recomputed every time the price moves. For a number the
+    company itself reported, and for how it changed over time, use
+    `get_financials` — those are audited and filed. For the company's own
+    explanation of it, use `search_filings`.
+
+    A metric the provider does not have is simply absent. A company with no
+    earnings has no P/E, and that absence is a fact about the company — do not
+    read it as a zero, and do not substitute the forward estimate for it.
     """
     try:
-        financials = finnhub.get_basic_financials(symbol)
-    except finnhub.UnknownSymbolError as exc:
+        stats = prices.get_key_stats(symbol)
+    except prices.UnknownSymbolError as exc:
         return _fail(str(exc))
-    except (finnhub.FinnhubError, ValueError) as exc:
-        return _fail(f"Could not fetch financials for {symbol!r}: {exc}")
+    except (prices.PriceDataError, ValueError) as exc:
+        return _fail(f"Could not fetch key stats for {symbol!r}: {exc}")
 
-    metrics = financials.present()
+    metrics = stats.present()
     if not metrics:
-        return _fail(f"No financial metrics are available for {financials.symbol}.")
+        return _fail(f"No market metrics are available for {stats.symbol}.")
 
     lines = "\n".join(f"  {name:<24} {value:,.2f}" for name, value in metrics.items())
     return (
-        f"{financials.symbol} key metrics (provider-computed, not from the "
-        f"audited filings):\n{lines}",
+        f"{stats.symbol} key metrics (provider-computed, not from the audited "
+        f"filings):\n{lines}",
         [],
     )
 
 
-# ---------------------------------------------------------------------------
-# get_company_news
-# ---------------------------------------------------------------------------
-
-
-class CompanyNewsArgs(BaseModel):
+class PriceHistoryArgs(BaseModel):
     symbol: str = Field(description="Stock ticker symbol, e.g. 'AAPL'.")
-    from_date: str | None = Field(
-        default=None,
-        description="Start date, ISO 'YYYY-MM-DD'. Defaults to a week ago — "
-        "leave it unset unless the question names a period.",
-    )
-    to_date: str | None = Field(
-        default=None, description="End date, ISO 'YYYY-MM-DD'. Defaults to today."
-    )
-    limit: int = Field(
-        default=finnhub.DEFAULT_NEWS_LIMIT,
-        description=f"Maximum number of articles, newest first (1-{MAX_NEWS_LIMIT}). "
-        "Leave it unset unless the question is specifically about news volume — "
-        "every article returned becomes a source under the answer.",
+    period: str = Field(
+        default=prices.DEFAULT_PERIOD,
+        description="How far back to look: "
+        + ", ".join(prices.VALID_PERIODS)
+        + ". Pick the one that matches the question; default is 1y.",
     )
 
 
-@tool(args_schema=CompanyNewsArgs, response_format="content_and_artifact")
-def get_company_news(
-    symbol: str,
-    from_date: str | None = None,
-    to_date: str | None = None,
-    limit: int = finnhub.DEFAULT_NEWS_LIMIT,
+@tool(args_schema=PriceHistoryArgs, response_format="content_and_artifact")
+def get_price_history(
+    symbol: str, period: str = prices.DEFAULT_PERIOD
 ) -> tuple[str, list[Citation]]:
-    """Get recent news headlines for ONE SPECIFIC ticker.
+    """Get a summary of how one ticker's price moved over a period.
 
-    Use for "what's the latest on AAPL" — questions scoped to a single named
-    company, where a feed of that company's headlines is what's wanted. Dates
-    default to the trailing week, so a symbol alone is a valid call.
+    Use for "how has X moved since the last 10-K", "how did X do this year",
+    "how volatile is X". Returns the first and last close, the percentage
+    change between them, the period high and low, annualised volatility, and
+    about five evenly spaced closes that trace the shape of the move.
 
-    For anything not scoped to one ticker — analyst opinion, competitor or
-    industry context, macro events, "how does X compare to Y" — use
-    `web_search` instead; this feed cannot answer those. For what the company
-    officially disclosed, use `search_filings`.
+    It is a SUMMARY, not a series. There are no individual daily bars and no
+    intraday data, so describe the shape of the move — do not quote a price on
+    a day you were not given one for, and do not interpolate between the
+    points you were given.
 
-    Read the results with some skepticism. This feed is thick with syndicated
-    aggregator content and with market-wide articles that merely mention the
-    ticker in passing, so a high article count is not itself a signal that
-    something is happening. Judge each headline on its own, prefer named
-    publishers, and say when a claim rests on a single low-quality source.
+    Closes are adjusted for splits and dividends, so the percentage change is a
+    total return and will not match a raw price chart across a split or a large
+    dividend. Say "total return" where the difference matters.
+
+    For today's price alone, `get_quote` is one call instead of a year of data.
+    For what the company reported over the same years, `get_financials`.
     """
     try:
-        articles = finnhub.get_company_news(
-            symbol,
-            from_date=from_date,
-            to_date=to_date,
-            limit=max(1, min(limit, MAX_NEWS_LIMIT)),
-        )
-    except finnhub.UnknownSymbolError as exc:
+        summary = prices.get_price_history(symbol, period=period)
+    except prices.UnknownSymbolError as exc:
         return _fail(str(exc))
-    except (finnhub.FinnhubError, ValueError) as exc:
-        return _fail(f"Could not fetch news for {symbol!r}: {exc}")
+    except (prices.PriceDataError, ValueError) as exc:
+        return _fail(f"Could not fetch price history for {symbol!r}: {exc}")
 
-    if not articles:
-        return (
-            f"No news articles for {symbol.upper()} in the requested window. "
-            f"The symbol is valid — this is a quiet period, not missing data.",
-            [],
-        )
+    vol = (
+        "n/a"
+        if summary.realised_vol_pct is None
+        else f"{summary.realised_vol_pct:.1f}% annualised"
+    )
+    path = "\n".join(f"    {day}  {close:,.2f}" for day, close in summary.anchors)
 
-    citations = [
-        Citation(
-            type="news",
-            label=f"{article.source} — {article.headline}".strip(" —"),
-            source_url=article.url,
-        )
-        for article in articles
-    ]
-
-    blocks = []
-    for i, (article, citation) in enumerate(zip(articles, citations), start=1):
-        summary = article.summary[:MAX_SUMMARY_CHARS]
-        if len(article.summary) > MAX_SUMMARY_CHARS:
-            summary += "…"
-        blocks.append(
-            f"[{i}] {citation.label}\n"
-            f"{article.published_date.isoformat()} · {article.url}"
-            + (f"\n{summary}" if summary else "")
-        )
-
-    header = f"{len(articles)} article(s) for {symbol.upper()}, newest first:"
-    return "\n\n".join([header, *blocks]), citations
+    text = (
+        f"{summary.symbol} price over {summary.period} "
+        f"({summary.start_date} to {summary.end_date}, {summary.sessions} sessions):\n"
+        f"  start close     {summary.start_close:,.2f}\n"
+        f"  latest close    {summary.end_close:,.2f}\n"
+        f"  total return    {summary.percent_change:+.2f}%\n"
+        f"  period high     {summary.high:,.2f}\n"
+        f"  period low      {summary.low:,.2f}\n"
+        f"  volatility      {vol}\n"
+        f"  path (evenly spaced closes, NOT every session):\n{path}"
+    )
+    # No citation, for the same reason get_quote returns none.
+    return text, []
 
 
 # ---------------------------------------------------------------------------
@@ -449,20 +417,29 @@ class WebSearchArgs(BaseModel):
 
 @tool(args_schema=WebSearchArgs, response_format="content_and_artifact")
 def web_search(query: str, days: int | None = None) -> tuple[str, list[Citation]]:
-    """Search the financial web for context that is not tied to one ticker's news feed.
+    """Search the financial web — news, analyst commentary, and anything recent.
 
-    This is the tool for analyst commentary, competitor and industry trends,
-    macro and regulatory events, explanations of a market move, and any
-    comparison spanning several companies. Results are restricted to a curated
-    list of reputable finance and news domains, so what comes back is citable.
+    **This is the news tool.** Use it for "what's the latest on Apple" as well
+    as for analyst commentary, competitor and industry trends, macro and
+    regulatory events, explanations of a market move, and comparisons spanning
+    several companies. Results are restricted to a curated list of reputable
+    finance and news domains, so what comes back is citable.
 
-    Prefer `get_company_news` when the question is simply "what's the latest
-    on <one ticker>", and `search_filings` for what a company itself
-    disclosed. Reach for this one when neither of those can answer — which is
-    most questions that name more than one company, or none.
+    Set `days` for anything time-scoped — "this week", "the latest", "since
+    earnings" — which switches the search to recent news and is what makes a
+    news question work. Leave it unset for durable context like strategy or
+    industry structure, where a good analysis does not expire in a week. When
+    asking about one company, name it AND its ticker: "Apple (AAPL) news".
 
-    Set `days` when recency matters; leave it unset otherwise, since a good
-    analysis of a company's strategy does not expire in a week.
+    For what a company itself officially disclosed, use `search_filings`; for
+    its reported numbers, `get_financials`.
+
+    **A result that mentions neither the company nor its ticker is not evidence
+    about that company.** This search always returns something plausible for
+    any query, including for a company that does not exist — market-wide
+    stories, sector commentary, an unrelated firm. Read each result and say
+    plainly when nothing found is actually about the company asked for, rather
+    than presenting adjacent coverage as though it were.
     """
     try:
         results = websearch.web_search(query, days=days)
@@ -583,7 +560,7 @@ def get_financials(
     for **how any of them changed over time**, which is the one thing no single
     filing can show.
 
-    Prefer this over `get_basic_financials` whenever the question is about a
+    Prefer this over `get_key_stats` whenever the question is about a
     reported figure or a trend. That tool returns a market-data provider's own
     computed ratios — P/E, beta, the 52-week range — which are useful for what
     the market currently thinks and are NOT audited. This one is what the
@@ -667,8 +644,8 @@ TOOLS = [
     search_filings,
     get_financials,
     get_quote,
-    get_basic_financials,
-    get_company_news,
+    get_key_stats,
+    get_price_history,
     web_search,
 ]
 
@@ -719,11 +696,11 @@ def describe_tool_call(name: str, args: dict | None = None) -> str:
     if name == "get_quote":
         return f"Checking {symbol} price"
 
-    if name == "get_basic_financials":
+    if name == "get_key_stats":
         return f"Fetching {symbol} valuation metrics"
 
-    if name == "get_company_news":
-        return f"Scanning {symbol} news"
+    if name == "get_price_history":
+        return f"Charting {symbol} — {args.get('period') or '1y'} price move"
 
     if name == "web_search":
         return f"Searching the web — “{_shorten(args.get('query') or '', 48)}”"

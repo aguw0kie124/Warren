@@ -55,7 +55,7 @@ EDGAR API -> tickers -> edgar -> parser -> chunker -> embeddings -> store -> Pos
 
 ## Setup
 
-Requires Python 3.13 and Docker. SEC ingestion also requires a real `EDGAR_USER_AGENT`, and the default local embedding model requires accepting the Hugging Face license for `google/embeddinggemma-300m` once before the first ingest.
+Requires Python 3.13 and Docker. Add your credentials to `.env` before starting the API. SEC ingestion also requires a real `EDGAR_USER_AGENT`.
 
 ```bash
 # 1. Start Postgres (pgvector)
@@ -65,8 +65,7 @@ docker compose up -d --wait
 /usr/local/bin/python3.13 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev]"
 
-# 3. Copy env file and fill in your keys (Anthropic, Finnhub, Tavily, LangSmith)
-cp .env.example .env
+# 3. Create a .env file using .env.example as a reference, then fill in your keys.
 
 # 4. Run the service
 .venv/bin/python -m uvicorn app.api:app --reload

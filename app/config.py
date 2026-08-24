@@ -63,7 +63,6 @@ class Settings(BaseSettings):
     # Free tiers are sufficient for both. Neither is needed for Module A, so
     # both default to empty and fail with a pointed message at first use rather
     # than at import.
-    finnhub_api_key: str = ""
     tavily_api_key: str = ""
 
     # --- agent (Module C) ---
